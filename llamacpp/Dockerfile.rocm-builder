@@ -1,0 +1,43 @@
+# Produces llama-rocm-builder:latest — a cached stage containing the compiled
+# llama-server binary for gfx1100 (Navi 31 / RX 7900 XTX).
+# Rebuild this only when llama.cpp itself needs updating:
+#   docker build -f Dockerfile.rocm-builder -t llama-rocm-builder:latest .
+FROM rocm/dev-ubuntu-24.04:7.2.2-complete
+
+# ROCm tools are pre-installed in the base image. Remove AMD repo sources first
+# to avoid their expired GPG signatures blocking apt-get update.
+RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.list && \
+    apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    pkg-config \
+    libcurl4-openssl-dev \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache-busting: checks latest release via GitHub API
+ADD "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" latest_release.json
+
+RUN LATEST_TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | grep -oP '"tag_name": "\K[^"]+') && \
+    rm -f latest_release.json && \
+    git clone --depth 1 --branch "$LATEST_TAG" https://github.com/ggml-org/llama.cpp.git .
+
+# Build with HIP backend targeting gfx1100 (Navi 31 / RX 7900 XTX)
+# GGML_NATIVE=OFF: binary must run inside container, not tuned to host CPU
+# BUILD_SHARED_LIBS default (ON): required — ROCm HIP cannot be statically linked
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=ON \
+    -DAMDGPU_TARGETS=gfx1100 \
+    -DGGML_NATIVE=OFF \
+    -DGGML_OPENMP=ON \
+    -DGGML_HIP_ROCWMMA_FATTN=ON \
+    -DGGML_HIP_MMQ_MFMA=ON \
+    -DGGML_HIP_GRAPHS=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build build --config Release -j $(nproc) && \
+    cmake --install build

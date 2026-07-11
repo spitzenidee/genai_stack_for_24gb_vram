@@ -1,0 +1,64 @@
+# Stage 1: Build
+FROM ubuntu:24.04 AS builder
+
+# System-Abhängigkeiten installieren
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    pkg-config \
+    libcurl4-openssl-dev \
+    libgomp1
+
+WORKDIR /app
+
+# Cache-Busting: Prüft das neueste Release via GitHub API
+ADD "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" latest_release.json
+
+# Klone die neueste Release-Version
+RUN LATEST_TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | grep -oP '"tag_name": "\K[^"]+') && \
+    rm -f latest_release.json && \
+    git clone --depth 1 --branch "$LATEST_TAG" https://github.com/ggml-org/llama.cpp.git .
+
+# Kompilierung optimiert für Ryzen 7940HS (Zen 4)
+# Flags fixed to the benchmarked best config: current_legacy_lto_avxvnni
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_C_FLAGS="-march=znver4 -mtune=znver4" \
+    -DCMAKE_CXX_FLAGS="-march=znver4 -mtune=znver4" \
+    -DGGML_OPENMP=ON \
+    -DGGML_NATIVE=ON \
+    -DGGML_LTO=ON \
+    -DGGML_SSE42=ON \
+    -DGGML_AVX=ON \
+    -DGGML_AVX2=ON \
+    -DGGML_FMA=ON \
+    -DGGML_F16C=ON \
+    -DGGML_BMI2=ON \
+    -DGGML_AVX_VNNI=ON \
+    -DGGML_AVX512=ON \
+    -DGGML_AVX512_VBMI=ON \
+    -DGGML_AVX512_VNNI=ON \
+    -DGGML_AVX512_BF16=ON && \
+    cmake --build build --config Release -j $(nproc)
+
+# Stage 2: Slim Runtime Image
+FROM ubuntu:24.04
+
+# Nur notwendige Laufzeit-Bibliotheken installieren
+RUN apt-get update && apt-get install -y \
+    libcurl4 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Kopiere nur die Binaries aus dem Builder-Stage
+COPY --from=builder /app/build/bin/llama-cli /usr/local/bin/llama-cli
+COPY --from=builder /app/build/bin/llama-server /usr/local/bin/llama-server
+
+# Standardmäßig den Server starten (OpenAI-kompatibel)
+ENTRYPOINT ["llama-server"]
+

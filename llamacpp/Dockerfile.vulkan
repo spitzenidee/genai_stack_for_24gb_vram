@@ -1,0 +1,60 @@
+# Single multi-stage Vulkan build.
+# Unlike ROCm (which takes 20+ min and uses an 8 GB base image), Vulkan builds
+# in ~5 min from plain Ubuntu, so a separate builder image is not worth the overhead.
+# To rebuild: docker compose build llama-cpp-vulkan
+
+### Build stage
+FROM ubuntu:24.04 AS build
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    pkg-config \
+    libcurl4-openssl-dev \
+    libgomp1 \
+    libvulkan-dev \
+    glslc \
+    spirv-headers \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache-busting: checks latest release via GitHub API
+ADD "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" latest_release.json
+
+RUN LATEST_TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | grep -oP '"tag_name": "\K[^"]+') && \
+    rm -f latest_release.json && \
+    git clone --depth 1 --branch "$LATEST_TAG" https://github.com/ggml-org/llama.cpp.git .
+
+# Build with Vulkan backend
+# GGML_NATIVE=OFF: binary must run inside container, not tuned to host CPU
+# No AMDGPU_TARGETS needed — Vulkan driver selects the device at runtime
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_VULKAN=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_OPENMP=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build build --config Release -j$(nproc) && \
+    cmake --install build
+
+### Runtime stage
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    libgomp1 \
+    libcurl4-openssl-dev \
+    mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/llama-server /usr/local/bin/llama-server
+COPY --from=build /usr/local/lib/ /usr/local/lib/
+
+# Point Vulkan loader to RADV ICD explicitly
+# Ubuntu 24.04 mesa-vulkan-drivers installs this as radeon_icd.json (no arch suffix)
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+ENTRYPOINT ["/usr/local/bin/llama-server"]

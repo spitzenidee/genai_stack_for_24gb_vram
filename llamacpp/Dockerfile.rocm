@@ -1,0 +1,10 @@
+# Runtime stage — built on top of the pre-compiled builder image.
+# To update llama.cpp: rebuild Dockerfile.rocm-builder first, then this.
+# To iterate on runtime config only: just rebuild this file (seconds, no recompile).
+FROM llama-rocm-builder:latest
+
+# cmake outputs binary and shared libs both to build/bin/
+# They were installed to /usr/local/bin/ in the builder — point linker there.
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+ENTRYPOINT ["/usr/local/bin/llama-server"]

@@ -1,0 +1,205 @@
+services:
+
+  open-webui:
+    depends_on:
+      - llama-cpp-cpu
+      - llama-cpp-vulkan
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    volumes:
+      - ${APP_ROOT}/open-webui:/app/backend/data
+    ports:
+      - "${OPEN_WEBUI_PORT}:8080"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - 'AIOHTTP_CLIENT_TIMEOUT=7200'
+      - 'FORWARDED_ALLOW_IPS=172.16.0.0/12'
+      - 'OTEL_SERVICE_NAME=open-webui'
+      - 'OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318'
+      - 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
+    restart: unless-stopped
+
+  llama-cpp-cpu:
+    build:
+      context: ./llamacpp
+      dockerfile: Dockerfile.cpu
+    image: llama-cpp-zen4:latest
+    container_name: llama-server-zen4
+    volumes:
+      - ${APP_ROOT}/llamacpp/hfmodels:/models
+      - ${APP_ROOT}/llamacpp/models.ini:/config/models.ini:ro
+    ports:
+      - "${LLAMA_CPU_PORT}:8090"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LLAMA_CPU_CPUS}'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command: >
+      --models-dir /models
+      --models-preset /config/models.ini
+      --host 0.0.0.0
+      --port 8090
+      --models-max ${LLAMA_CPU_MODELS_MAX}
+      -cb
+      -b ${LLAMA_CPU_BATCH_SIZE}
+      -ub ${LLAMA_CPU_UBATCH_SIZE}
+      -t ${LLAMA_CPU_THREADS}
+      --metrics
+    restart: unless-stopped
+
+  llama-cpp-vulkan:
+    build:
+      context: ./llamacpp
+      dockerfile: Dockerfile.vulkan
+    image: llama-cpp-vulkan-gfx1100:latest
+    container_name: llama-server-vulkan
+    devices:
+      - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
+      - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
+    group_add:
+      - "${RENDER_GID}"   # render
+      - "${VIDEO_GID}"    # video
+    volumes:
+      - ${APP_ROOT}/llamacpp/hfmodels:/models
+      - ${APP_ROOT}/llamacpp/models.ini:/config/models.ini:ro
+    ports:
+      - "${LLAMA_VULKAN_PORT}:8092"
+    shm_size: '256m'
+    depends_on:
+      - lact
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command: >
+      --models-dir /models
+      --models-preset /config/models.ini
+      --host 0.0.0.0
+      --port 8092
+      --models-max ${LLAMA_VULKAN_MODELS_MAX}
+      -cb
+      -b ${LLAMA_VULKAN_BATCH_SIZE}
+      -ub ${LLAMA_VULKAN_UBATCH_SIZE}
+      --metrics
+    restart: unless-stopped
+
+  # AMD GPU sysfs Prometheus exporter — pure stdlib Python, no ROCm.
+  # Reads /sys/class/drm and /sys/class/hwmon from the container's sysfs view
+  # (already accessible; no extra mounts needed — containers share the VM kernel's sysfs).
+  gpu-exporter:
+    image: python:3.13-alpine
+    container_name: gpu-exporter
+    environment:
+      - PORT=${GPU_EXPORTER_PORT}
+    volumes:
+      - ${APP_ROOT}/otel/amdgpu_exporter.py:/app/amdgpu_exporter.py:ro
+    command: python3 /app/amdgpu_exporter.py
+    restart: unless-stopped
+
+  # Prometheus HTTP SD: reads /v1/models status from each llama server and returns
+  # ONLY currently-loaded models as scrape targets. Prevents spurious model loads
+  # that occur when the OTel Collector scrapes /metrics?model=X for unloaded models.
+  llama-sd:
+    image: python:3.12-alpine
+    container_name: llama-sd
+    environment:
+      - PORT=${LLAMA_SD_PORT}
+      - >-
+        LLAMA_SERVERS=[{"url":"http://llama-cpp-cpu:8090","name":"cpu"},{"url":"http://llama-cpp-vulkan:8092","name":"vulkan"}]
+    volumes:
+      - ${APP_ROOT}/otel/llama_sd.py:/app/llama_sd.py:ro
+    command: python3 /app/llama_sd.py
+    restart: unless-stopped
+    depends_on:
+      - llama-cpp-cpu
+      - llama-cpp-vulkan
+
+  otel-collector:
+    # NOTE: gpu-exporter omitted from depends_on intentionally — OTel handles
+    # a temporarily unavailable scrape target gracefully without blocking startup.
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    environment:
+      - LLAMA_SD_PORT=${LLAMA_SD_PORT}
+    group_add:
+      - "988"   # docker group — required for docker_stats receiver + resourcedetection
+    volumes:
+      - ${APP_ROOT}/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - /var/lib/docker/containers:/var/log/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "${OTEL_GRPC_PORT}:4317"   # OTLP gRPC — receive push traces from services on this host
+      - "${OTEL_HTTP_PORT}:4318"   # OTLP HTTP
+    restart: unless-stopped
+    depends_on:
+      - llama-sd
+
+  lact:
+    image: ghcr.io/ilya-zlobintsev/lact:v0.9.0    # official image: daemon + CLI only (no GUI)
+    container_name: lact
+    privileged: true                              # required: sysfs writes for power/voltage control
+    devices:
+      - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
+      - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
+    volumes:
+      - ${APP_ROOT}/lact:/etc/lact                          # config.yaml persists here
+    restart: unless-stopped
+
+  comfyui-rocm:
+    build:
+      context: ./comfyui
+      dockerfile: Dockerfile.rocm
+    image: comfyui-rocm-gfx1100:latest
+    container_name: comfyui-rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
+    group_add:
+      - "${RENDER_GID}"   # render
+      - "${VIDEO_GID}"    # video
+    environment:
+      # Disable SDMA engine for ROCm memory transfers — reduces IOMMU TLB flush
+      # frequency in the VFIO/KVM passthrough context.  Without this, async weight
+      # offloading streams trigger amdgpu_tlb_fence_work / svm_range_restore_work
+      # workqueue storms on kernel 6.17 that saturate VM vCPUs while the GPU idles.
+      - HSA_ENABLE_SDMA=0
+    volumes:
+      - ${APP_ROOT}/comfyui/models:/ComfyUI/models       # shared with CPU instance — no duplication
+      - ${APP_ROOT}/comfyui/output:/ComfyUI/output
+      - ${APP_ROOT}/comfyui/input:/ComfyUI/input
+      - ${APP_ROOT}/comfyui/custom_nodes:/ComfyUI/custom_nodes
+      # Patched built-in scripts — single-file mounts override the image file
+      # without shadowing the rest of comfy_extras/
+      - ${APP_ROOT}/comfyui/patches/nodes_qwen.py:/ComfyUI/comfy_extras/nodes_qwen.py:ro
+    ports:
+      - "${COMFYUI_ROCM_PORT}:8188"
+    depends_on:
+      - lact
+    shm_size: '2gb'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    # Override Dockerfile CMD to add performance flags without a rebuild.
+    # --enable-triton-backend  : enable comfy_kitchen Triton kernels (fused RoPE,
+    #                            fp8 ops) — benefits the Qwen2.5-VL text encoder pass.
+    # --dont-upcast-attention  : keep attention in bf16 throughout; avoids an extra
+    #                            fp32 memory pass over Q/K/V in the VL encoder.
+    # --fast                   : enable all experimental optimizations (may affect stability).
+    # --preview-method latent2rgb : near-zero-cost linear preview instead of TAESD.
+    command: >
+      python3 main.py --listen 0.0.0.0 --port 8188
+      --use-pytorch-cross-attention --normalvram --reserve-vram 2 --cache-lru 1
+      --enable-triton-backend --dont-upcast-attention
+      --fast
+      --preview-method latent2rgb
+    restart: unless-stopped
+

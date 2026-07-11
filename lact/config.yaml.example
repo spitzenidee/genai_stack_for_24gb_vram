@@ -1,0 +1,30 @@
+# Loop-test the voltage offset with this one-liner:
+# i=0; while true; do i=$((i+1)); echo "=== Request $i ==="; curl -s http://localhost:8092/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M","messages":[{"role":"user","content":"Explain the history of mathematics in exhaustive detail covering every major development, mathematician, and theorem from ancient times to today."}],"max_tokens":2048,"stream":false}' | python3 -c "import json,sys; d=json.load(sys.stdin); t=d.get('timings',{}); print(f't/s={t.get(\"predicted_per_second\",\"?\"):.1f}, tokens={t.get(\"predicted_n\",\"?\")}')"; done
+# Some stats:
+# -150mV: ~48.5 t/s, fully stable
+# -160mV: ~51.0 t/s, fully stable
+# -175mV: ~49.5 t/s, unstable
+# Fan control — Option A: PMFW firmware targets (uncomment to activate)
+# Lets the GPU firmware manage the fan curve dynamically, but with more
+# aggressive targets. Safer than a custom curve: works even if LACT restarts.
+# Tune target_temperature down / acoustic_target up to increase fan speed at load.
+version: 5
+daemon:
+  log_level: info
+  disable_clocks_cleanup: true
+apply_settings_timer: 5
+gpus:
+  RANDOM-GPU-ID-EXAMPLE-0000:00:00.0:
+    fan_control_enabled: false
+    pmfw_options:
+      acoustic_limit: 2200
+      acoustic_target: 1800
+      target_temperature: 65
+      zero_rpm: true
+      zero_rpm_threshold: 50
+    power_cap: 265.0
+    performance_level: auto
+    voltage_offset: -160
+    #max_memory_clock: 1250
+current_profile: null
+auto_switch_profiles: false

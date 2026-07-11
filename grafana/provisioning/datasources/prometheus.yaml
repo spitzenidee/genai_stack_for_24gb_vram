@@ -1,0 +1,23 @@
+# Grafana datasource provisioning — genai_stack
+# Drop this file into /etc/grafana/provisioning/datasources/ on the Grafana LXC
+# and restart Grafana (systemctl restart grafana-server).
+#
+# If a "Prometheus" datasource already exists in your Grafana instance you can
+# skip this file entirely — just make sure the datasource is named "Prometheus"
+# so the dashboard template variable resolves correctly.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Point at wherever your Prometheus / Mimir / VictoriaMetrics instance lives.
+    # Change this URL to match your actual Prometheus endpoint.
+    url: http://localhost:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s        # match collector.yaml scrape_interval
+      cacheLevel: Low

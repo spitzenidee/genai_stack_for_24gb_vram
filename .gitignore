@@ -1,0 +1,38 @@
+# =============================================================================
+# open-webui — entire runtime data directory (DB, cache, uploads, embeddings)
+# =============================================================================
+open-webui/
+
+# =============================================================================
+# llama-cpp — model files (large binaries, managed outside git)
+# =============================================================================
+hfmodels/
+llamacpp/hfmodels/
+
+# =============================================================================
+# ComfyUI — runtime data directories (created on first container start)
+# =============================================================================
+comfyui/models/
+comfyui/output/
+comfyui/input/
+comfyui/custom_nodes/
+# patches/ is intentionally tracked (these are source-controlled overrides)
+
+# =============================================================================
+# ollama — SSH keys (SECURITY: private key must never be committed)
+#          and model blobs (large binaries)
+# =============================================================================
+ollama/id_ed25519
+ollama/id_ed25519.pub
+ollama/models/
+
+# =============================================================================
+# Misc
+# =============================================================================
+# Environment variable files (whitelist .env.example)
+.env*
+!.env.example
+# Background download PID files left by hf_download.sh
+_dl
+tmp.md
+

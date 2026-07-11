@@ -1,0 +1,65 @@
+# ComfyUI — ROCm/HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
+# -complete variant required: --enable-triton-backend and --fast trigger TorchInductor/
+# Triton JIT kernel compilation at runtime, which needs hipcc from the full ROCm toolchain.
+FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+
+# Ubuntu 24.04 enforces PEP 668 — pip refuses to install into the system site-packages
+# without this flag. Setting it as an env var applies to all subsequent RUN pip calls.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# Remove stale AMD repo signatures (same fix as in llamacpp/Dockerfile.rocm-builder)
+RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm 7.2 nightly wheels — the stable index only has cp310/cp311 wheels;
+# nightly provides cp312 which matches Ubuntu 24.04's system Python.
+# Pinned to last-known-good dates; bump TORCH_DATE (and torchvision/torchaudio
+# versions below) to upgrade. Versions sourced from the running container.
+ARG TORCH_DATE=20260608
+RUN pip install --no-cache-dir --pre \
+    "torch==2.13.0.dev${TORCH_DATE}+rocm7.2" \
+    "torchvision==0.28.0.dev20260609+rocm7.2" \
+    "torchaudio==2.11.0.dev20260610+rocm7.2" \
+    --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+
+# Clone a pinned release tag — change ARG to upgrade
+# Releases: https://github.com/Comfy-Org/ComfyUI/releases
+ARG COMFYUI_VERSION=v0.21.1
+RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
+    https://github.com/Comfy-Org/ComfyUI.git /ComfyUI
+
+WORKDIR /ComfyUI
+
+RUN pip install --no-cache-dir -r requirements.txt requests
+
+# RDNA3 performance flags
+# PYTORCH_CUDA_ALLOC_CONF: gc threshold 0.8 — proactively reclaims unused VRAM blocks
+#   before OOM pressure builds; default 1.0 only reclaims when completely exhausted.
+#   expandable_segments:True is intentionally omitted — on ROCm 7.2 it causes hipMalloc
+#   to fail at first allocation (OOM with 0 B tracked).
+# HSA_ENABLE_SDMA=0 — also set here so it applies when running outside compose.
+# LD_PRELOAD jemalloc — reduces glibc malloc fragmentation (same as CPU image)
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8 \
+    HSA_ENABLE_SDMA=0
+
+# Persistent data lives in mounted volumes, not in the image
+VOLUME ["/ComfyUI/models", "/ComfyUI/output", "/ComfyUI/input", "/ComfyUI/custom_nodes"]
+
+EXPOSE 8188
+
+# --use-pytorch-cross-attention : uses PyTorch's built-in SDPA kernel; aotriton is compiled
+#   into ROCm wheels at build time — no additional runtime env var required.
+#   Does not require the flash-attn package (which needs a complex ROCm source build).
+# --normalvram          : let ComfyUI manage VRAM dynamically; safer when llama-server-rocm
+#   shares the same GPU and may hold several GB of model weights in VRAM.
+# --reserve-vram 2      : keep 2 GB reserved (headroom for llama-server-rocm + ROCm overhead)
+# --cache-lru 1         : 1 cached result — reduced from 2 to avoid competing with
+#   llama-server for VRAM on the shared GPU
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", \
+     "--use-pytorch-cross-attention", "--normalvram", "--reserve-vram", "2", "--cache-lru", "1"]
