@@ -31,9 +31,3 @@ GGUF text models are served by llama.cpp. Image generation uses safetensors/GGUF
 ## Configuration
 
 Runtime configuration is done via environment variables (`.env` file, not committed). See `llamacpp/models.ini.example` and `lact/config.yaml.example` for required config files.
-
-## Notes
-
-- Llama.cpp images are built from source at compose build time, always pulling the latest release tag.
-- ComfyUI uses ROCm with `HSA_ENABLE_SDMA=0` to avoid workqueue storms under KVM/VFIO passthrough.
-- This repo mirrors a sanitized subset of a private repo; some config files and model directories are excluded.
