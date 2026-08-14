@@ -1,7 +1,10 @@
 # Single multi-stage Vulkan build.
 # Unlike ROCm (which takes 20+ min and uses an 8 GB base image), Vulkan builds
 # in ~5 min from plain Ubuntu, so a separate builder image is not worth the overhead.
-# To rebuild: docker compose build llama-cpp-vulkan
+# Shared by both llamacpp-egpu and llamacpp-igpu — Vulkan/RADV selects the
+# target GPU at runtime via the bind-mounted render node, no arch-specific
+# build needed.
+# To rebuild: docker compose build llamacpp-egpu llamacpp-igpu
 
 ### Build stage
 FROM ubuntu:24.04 AS build

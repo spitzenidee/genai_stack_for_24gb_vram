@@ -1,0 +1,44 @@
+version = 1
+
+; ── Global defaults inherited by every model ──────────────────────────────────
+; Mirrors models-egpu.ini.example's tuning philosophy. n-gpu-layers stays at 99
+; (full offload) — the 16 GB budget constraint is enforced by only listing
+; models below whose weights + KV cache (at the given -c) fit entirely in
+; VRAM, not by reducing the offloaded layer count.
+[*]
+cache-type-k = q8_0
+cache-type-v = q8_0
+flash-attn = auto
+parallel = 1
+context-shift = true
+no-mmap = true
+timeout = 7200
+sleep-idle-seconds = 1800
+threads = 4
+threads-batch = 7
+batch-size = 4096
+ubatch-size = 2048
+n-gpu-layers = 99
+jinja = true
+repeat-penalty = 1.05
+reasoning = on
+reasoning-budget = 8192
+reasoning-budget-message = Enough thinking, answering now.
+cache-reuse = 512
+kv-unified = true
+spec-type = ngram-mod
+spec-ngram-mod-n-match = 40
+spec-ngram-mod-n-min = 4
+spec-ngram-mod-n-max = 32
+spec-draft-n-max = 2
+; seed = 3407                    ; fixed seed for reproducibility
+
+; ── Per-model overrides ────────────────────────────────────────────────────────
+[VibeThinker-3B.Q8_0]
+model = /models/VibeThinker-3B.Q8_0.gguf
+c = 131072
+n-predict = 100000
+reasoning-budget = 98304
+temp = 1.0
+top-k = 0
+top-p = 0.95

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# blender-render — headless Cycles eGPU render wrapper
+#
+# Usage:
+#   blender-render <blend-file> [extra-blender-args]
+#
+# Forces:
+#   - background mode (-b)
+#   - Cycles engine (-E CYCLES)
+#   - HIP GPU backend (-- --cycles-device HIP)
+#   - scene render device = GPU (via --python-expr)
+#
+# This guarantees that a .blend file saved on a laptop with CPU compute still
+# renders on the eGPU when submitted to this service.
+#
+# Example:
+#   docker compose exec blender-rocm blender-render /work/scene.blend \
+#       -f 1 -o /work/output/frame_ -F PNG
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $(basename "$0") <blend-file> [extra-blender-args]" >&2
+    exit 1
+fi
+
+BLEND="$1"
+shift
+
+if [[ ! -r "$BLEND" ]]; then
+    echo "Error: cannot read blend file: $BLEND" >&2
+    exit 1
+fi
+
+# Extract -o and -F so they can be applied via Python. Blender's command-line
+# parser sometimes ignores them when the .blend file stores an absolute output
+# path; setting bpy.context.scene.render.filepath / image_settings.file_format
+# directly is more reliable.
+OUTPUT=""
+FORMAT=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--render-output)
+            OUTPUT="$2"
+            shift 2
+            ;;
+        -F|--render-format)
+            FORMAT="$2"
+            shift 2
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+PYTHON="import bpy; bpy.context.scene.cycles.device = 'GPU'"
+if [[ -n "$OUTPUT" ]]; then
+    PYTHON="$PYTHON; bpy.context.scene.render.filepath = r'${OUTPUT}'"
+fi
+if [[ -n "$FORMAT" ]]; then
+    PYTHON="$PYTHON; bpy.context.scene.render.image_settings.file_format = '${FORMAT}'"
+fi
+
+exec blender \
+    -b "$BLEND" \
+    --python-expr "$PYTHON" \
+    -E CYCLES \
+    "${ARGS[@]}" \
+    -- --cycles-device HIP

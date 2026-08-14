@@ -1,0 +1,85 @@
+# GROMACS — HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
+# -complete variant required: building GROMACS itself needs hipcc/amdclang++
+# from the full ROCm toolchain (same reasoning as comfyui/Dockerfile.rocm).
+FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+
+# This image does NOT set ROCM_PATH itself (confirmed empty at runtime) even
+# though /opt/rocm exists (symlink -> /etc/alternatives/rocm -> /opt/rocm-7.2.4)
+# with the compilers underneath — set it explicitly so the cmake flags below
+# resolve correctly.
+ENV ROCM_PATH=/opt/rocm
+
+# Remove stale AMD repo signatures (same fix as in llamacpp/Dockerfile.rocm-builder
+# and comfyui/Dockerfile.rocm)
+RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    build-essential \
+    git \
+    ca-certificates \
+    tmux \
+    curl \
+    unzip \
+    libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned release tag — change ARG to upgrade
+# Releases: https://github.com/gromacs/gromacs/releases
+ARG GROMACS_VERSION=v2026.3
+RUN git clone --depth 1 --branch ${GROMACS_VERSION} \
+    https://github.com/gromacs/gromacs.git /gromacs
+
+WORKDIR /gromacs/build
+
+# HIP backend for RDNA3 (gfx1100):
+#   - GMX_HIP_TARGET_ARCH (NOT the standard CMAKE_HIP_ARCHITECTURES!) is
+#     GROMACS's own cache variable for this — CMAKE_HIP_ARCHITECTURES gets
+#     silently overridden by GROMACS's own HIP cmake logic
+#     (cmake/gmxManageHipccConfig.cmake), so setting it directly has no
+#     effect. Confirmed the hard way: a build with only CMAKE_HIP_ARCHITECTURES
+#     set produced a binary whose embedded device code was still the default
+#     CDNA/GCN list (no gfx1100 at all) — every mdrun then segfaulted inside
+#     libamdhip64.so's device enumeration, even for -nb cpu (GROMACS always
+#     probes the GPU at startup). Setting GMX_HIP_TARGET_ARCH=gfx1100 also
+#     auto-enables GMX_ENABLE_AMD_RDNA_SUPPORT (matched via a gfx1xxx regex
+#     in the same cmake file).
+#   - GPU FFT library defaults to VkFFT for devices rocFFT doesn't officially
+#     support (all consumer RDNA cards) — no extra flag needed.
+#   - GMX_SIMD=AVX2_256, not AUTO: cmake auto-detected AVX_512 on this host
+#     (Ryzen 9 7940HS), but that build segfaults on every mdrun invocation —
+#     even CPU-only, before the log file is even opened. Known bad interaction
+#     between GROMACS/Clang AVX-512 codegen and Zen4's "double-pumped"
+#     (256-bit-wide hardware) AVX-512 implementation. AVX2_256 is stable.
+#   - GMX_MPI=OFF: single GPU workstation, thread-MPI (built in) is sufficient.
+#   - REGRESSIONTEST_DOWNLOAD=OFF: skip GROMACS's own correctness test suite
+#     to keep the build faster/smaller; flip to ON to validate the HIP build.
+#   - Default (Makefiles) generator, not Ninja: GMX_BUILD_OWN_FFTW=ON's
+#     internal FFTW3 sub-build errors out under Ninja ("Cannot build FFTW3
+#     automatically ... with ninja", cmake/gmxManageFFTLibraries.cmake).
+RUN cmake .. \
+      -DCMAKE_C_COMPILER=${ROCM_PATH}/llvm/bin/clang \
+      -DCMAKE_CXX_COMPILER=${ROCM_PATH}/llvm/bin/clang++ \
+      -DCMAKE_HIP_COMPILER=${ROCM_PATH}/bin/amdclang++ \
+      -DCMAKE_PREFIX_PATH=${ROCM_PATH} \
+      -DGMX_GPU=HIP \
+      -DGMX_HIP_TARGET_ARCH=gfx1100 \
+      -DGMX_SIMD=AVX2_256 \
+      -DGMX_BUILD_OWN_FFTW=ON \
+      -DGMX_MPI=OFF \
+      -DREGRESSIONTEST_DOWNLOAD=OFF \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local/gromacs \
+    && make -j$(nproc) && make install \
+    && cd / && rm -rf /gromacs
+
+# LD_PRELOAD jemalloc — reduces glibc malloc fragmentation from the repeated
+# per-step allocations in neighbor-search/domain-decomposition over long runs
+# (same rationale as llamacpp/Dockerfile.cpu and comfyui/Dockerfile.rocm).
+ENV PATH=/usr/local/gromacs/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/gromacs/lib:${LD_LIBRARY_PATH} \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    HSA_ENABLE_SDMA=0
+
+# Persistent data lives in a mounted volume, not in the image
+VOLUME ["/work"]
+WORKDIR /work

@@ -1,6 +1,6 @@
 # Grafana dashboard provider — genai_stack
 # Drop this file into /etc/grafana/provisioning/dashboards/ on the Grafana LXC.
-# Also copy grafana/dashboards/llama-vulkan-amdgpu.json to the path below.
+# Also copy grafana/dashboards/llama-gpu-amdgpu.json to the path below.
 #
 # After copying, reload with: systemctl reload grafana-server
 # or:  curl -X POST http://admin:admin@localhost:3000/api/admin/provisioning/dashboards/reload
