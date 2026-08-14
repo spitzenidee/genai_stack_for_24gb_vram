@@ -1,9 +1,9 @@
 services:
 
   open-webui:
+    profiles: ["llama"]
     depends_on:
-      - llama-cpp-cpu
-      - llama-cpp-vulkan
+      - llamacpp-egpu
     image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
     volumes:
@@ -23,44 +23,13 @@ services:
       - 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
     restart: unless-stopped
 
-  llama-cpp-cpu:
-    build:
-      context: ./llamacpp
-      dockerfile: Dockerfile.cpu
-    image: llama-cpp-zen4:latest
-    container_name: llama-server-zen4
-    volumes:
-      - ${APP_ROOT}/llamacpp/hfmodels:/models
-      - ${APP_ROOT}/llamacpp/models.ini:/config/models.ini:ro
-    ports:
-      - "${LLAMA_CPU_PORT}:8090"
-    deploy:
-      resources:
-        limits:
-          cpus: '${LLAMA_CPU_CPUS}'
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    command: >
-      --models-dir /models
-      --models-preset /config/models.ini
-      --host 0.0.0.0
-      --port 8090
-      --models-max ${LLAMA_CPU_MODELS_MAX}
-      -cb
-      -b ${LLAMA_CPU_BATCH_SIZE}
-      -ub ${LLAMA_CPU_UBATCH_SIZE}
-      -t ${LLAMA_CPU_THREADS}
-      --metrics
-    restart: unless-stopped
-
-  llama-cpp-vulkan:
+  llamacpp-egpu:
     build:
       context: ./llamacpp
       dockerfile: Dockerfile.vulkan
-    image: llama-cpp-vulkan-gfx1100:latest
-    container_name: llama-server-vulkan
+    image: llama-cpp-vulkan:latest
+    container_name: llamacpp-egpu
+    profiles: ["llama"]
     devices:
       - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
       - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
@@ -69,9 +38,9 @@ services:
       - "${VIDEO_GID}"    # video
     volumes:
       - ${APP_ROOT}/llamacpp/hfmodels:/models
-      - ${APP_ROOT}/llamacpp/models.ini:/config/models.ini:ro
+      - ${APP_ROOT}/llamacpp/models-egpu.ini:/config/models.ini:ro
     ports:
-      - "${LLAMA_VULKAN_PORT}:8092"
+      - "${LLAMA_EGPU_PORT}:8092"
     shm_size: '256m'
     depends_on:
       - lact
@@ -80,14 +49,54 @@ services:
         soft: -1
         hard: -1
     command: >
-      --models-dir /models
       --models-preset /config/models.ini
       --host 0.0.0.0
       --port 8092
-      --models-max ${LLAMA_VULKAN_MODELS_MAX}
+      --models-max ${LLAMA_EGPU_MODELS_MAX}
       -cb
-      -b ${LLAMA_VULKAN_BATCH_SIZE}
-      -ub ${LLAMA_VULKAN_UBATCH_SIZE}
+      -b ${LLAMA_EGPU_BATCH_SIZE}
+      -ub ${LLAMA_EGPU_UBATCH_SIZE}
+      --metrics
+    restart: unless-stopped
+
+  # Radeon 780M iGPU (Phoenix, gfx1103) — always-on, independent of the
+  # eGPU/gromacs/blender work-mode switch (separate hardware, no VRAM
+  # contention with the eGPU). Same Vulkan image as llamacpp-egpu: RADV
+  # selects the target device at runtime via the bind-mounted render node,
+  # no arch-specific build needed. Only serve models whose weights + KV
+  # cache fit entirely within the ~16 GB UMA carve-out (see models-igpu.ini).
+  llamacpp-igpu:
+    build:
+      context: ./llamacpp
+      dockerfile: Dockerfile.vulkan
+    image: llama-cpp-vulkan:latest
+    container_name: llamacpp-igpu
+    devices:
+      - ${GPU_IGPU_RENDER_DEVICE}:${GPU_IGPU_RENDER_DEVICE}
+      - ${GPU_IGPU_CARD_DEVICE}:${GPU_IGPU_CARD_DEVICE}
+    group_add:
+      - "${RENDER_GID}"   # render
+      - "${VIDEO_GID}"    # video
+    volumes:
+      - ${APP_ROOT}/llamacpp/hfmodels:/models
+      - ${APP_ROOT}/llamacpp/models-igpu.ini:/config/models.ini:ro
+    ports:
+      - "${LLAMA_IGPU_PORT}:8093"
+    shm_size: '256m'
+    depends_on:
+      - lact
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command: >
+      --models-preset /config/models.ini
+      --host 0.0.0.0
+      --port 8093
+      --models-max ${LLAMA_IGPU_MODELS_MAX}
+      -cb
+      -b ${LLAMA_IGPU_BATCH_SIZE}
+      -ub ${LLAMA_IGPU_UBATCH_SIZE}
       --metrics
     restart: unless-stopped
 
@@ -112,15 +121,17 @@ services:
     container_name: llama-sd
     environment:
       - PORT=${LLAMA_SD_PORT}
-      - >-
-        LLAMA_SERVERS=[{"url":"http://llama-cpp-cpu:8090","name":"cpu"},{"url":"http://llama-cpp-vulkan:8092","name":"vulkan"}]
+      - LLAMA_SERVERS=${LLAMA_SERVERS}
     volumes:
       - ${APP_ROOT}/otel/llama_sd.py:/app/llama_sd.py:ro
     command: python3 /app/llama_sd.py
     restart: unless-stopped
-    depends_on:
-      - llama-cpp-cpu
-      - llama-cpp-vulkan
+    # NOTE: no depends_on on the llama servers — this service must stay
+    # profile-free (otel-collector depends on it, and target discovery should
+    # keep working in every GPU work mode). get_targets() already catches
+    # per-server connection failures and skips them, so a stopped/profile-
+    # gated llamacpp-egpu is handled gracefully without a hard dependency
+    # that would otherwise force it to start regardless of the active mode.
 
   otel-collector:
     # NOTE: gpu-exporter omitted from depends_on intentionally — OTel handles
@@ -159,6 +170,7 @@ services:
       dockerfile: Dockerfile.rocm
     image: comfyui-rocm-gfx1100:latest
     container_name: comfyui-rocm
+    profiles: ["comfyui"]
     devices:
       - /dev/kfd:/dev/kfd
       - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
@@ -189,17 +201,75 @@ services:
         soft: -1
         hard: -1
     # Override Dockerfile CMD to add performance flags without a rebuild.
-    # --enable-triton-backend  : enable comfy_kitchen Triton kernels (fused RoPE,
-    #                            fp8 ops) — benefits the Qwen2.5-VL text encoder pass.
-    # --dont-upcast-attention  : keep attention in bf16 throughout; avoids an extra
-    #                            fp32 memory pass over Q/K/V in the VL encoder.
-    # --fast                   : enable all experimental optimizations (may affect stability).
-    # --preview-method latent2rgb : near-zero-cost linear preview instead of TAESD.
+    # --use-pytorch-cross-attention : PyTorch SDPA cross-attention kernel.
+    # --reserve-vram 2         : keep 2 GB VRAM free for other processes sharing the GPU.
+    # --cache-ram              : RAM pressure-based node result caching.
+    # --dont-upcast-attention  : keep attention in bf16 throughout, skip fp32 upcast.
+    # --async-offload 2        : two-stream async weight offloading.
+    # --preview-method latent2rgb : near-zero-cost linear latent preview.
     command: >
       python3 main.py --listen 0.0.0.0 --port 8188
-      --use-pytorch-cross-attention --normalvram --reserve-vram 2 --cache-lru 1
-      --enable-triton-backend --dont-upcast-attention
-      --fast
+      --use-pytorch-cross-attention --reserve-vram 2 --cache-ram
+      --dont-upcast-attention --async-offload 2
       --preview-method latent2rgb
+    restart: unless-stopped
+
+  # --- GPU work-mode: GROMACS (profile "gromacs") --------------------------
+  # HIP backend build for RDNA3 (gfx1100), GROMACS 2026.3 — full GPU offload
+  # (nb + pme + bonded + update). Container idles (sleep infinity); `make
+  # gromacs` switches to this mode, then use `docker compose exec gromacs-rocm
+  # bash` (or `tmux attach`) for interactive prep/mdrun sessions, e.g.:
+  #   gmx mdrun -ntmpi 1 -nb gpu -pme gpu -bonded gpu -update gpu -deffnm run1
+  gromacs-rocm:
+    build:
+      context: ./gromacs
+      dockerfile: Dockerfile.rocm
+    image: gromacs-hip-gfx1100:latest
+    container_name: gromacs-rocm
+    profiles: ["gromacs"]
+    devices:
+      - /dev/kfd:/dev/kfd
+      - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
+      - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
+    group_add:
+      - "${RENDER_GID}"   # render
+      - "${VIDEO_GID}"    # video
+    volumes:
+      - ${GROMACS_PROJECTS_DIR}:/work
+    working_dir: /work
+    entrypoint: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # --- GPU work-mode: Blender (profile "blender") ---------------------------
+  # Headless Blender 5.2 LTS with Cycles/HIP for the eGPU. Container idles;
+  # `make blender` switches to this mode, then
+  # `docker compose exec blender-rocm blender-render /work/scene.blend -f 1 ...`
+  # runs renders interactively. The wrapper forces GPU compute and HIP backend.
+  blender-rocm:
+    build:
+      context: ./blender
+      dockerfile: Dockerfile.rocm
+    image: blender-rocm-gfx1100:latest
+    container_name: blender-rocm
+    profiles: ["blender"]
+    user: "${UID:-1000}:${GID:-1000}"   # write renders as the host user
+    devices:
+      - /dev/kfd:/dev/kfd
+      - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
+      - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
+    group_add:
+      - "${RENDER_GID}"   # render
+      - "${VIDEO_GID}"    # video
+    environment:
+      - HSA_ENABLE_SDMA=0
+    volumes:
+      - ${APP_ROOT}/blender/work:/work
+    working_dir: /work
+    shm_size: '1gb'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    entrypoint: ["sleep", "infinity"]
     restart: unless-stopped
 

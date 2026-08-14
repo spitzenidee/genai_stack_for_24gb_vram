@@ -5,7 +5,7 @@
 set -euo pipefail
 
 URL="${1:?Usage: $0 <huggingface_url> [target_dir]}"
-TARGET_DIR="${2:-$(dirname "$(realpath "$0")")/_dl}"
+TARGET_DIR="${2:-/home/spitzem/docker/genai_stack/_dl}"
 FILENAME="$(basename "$URL")"
 LOG_FILE="$TARGET_DIR/${FILENAME%.gguf}_download.log"
 

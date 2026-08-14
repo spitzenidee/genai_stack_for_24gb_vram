@@ -1,0 +1,43 @@
+# Blender 5.2 LTS — headless Cycles/HIP rendering for RDNA3 (gfx1100 / RX 7900 XTX)
+# Build context: ./blender (sibling to this Dockerfile)
+FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+
+ENV ROCM_PATH=/opt/rocm
+
+# Same repo-signature cleanup used by the other ROCm images in this stack
+RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    xz-utils \
+    libgl1 \
+    libglib2.0-0 \
+    libfontconfig1 \
+    libsm6 \
+    libxrender1 \
+    libxfixes3 \
+    libxi6 \
+    libxkbcommon0 \
+    libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG BLENDER_VERSION=5.2.0
+ARG BLENDER_URL=https://download.blender.org/release/Blender5.2/blender-${BLENDER_VERSION}-linux-x64.tar.xz
+
+RUN mkdir -p /opt/blender && \
+    curl -fsSL ${BLENDER_URL} | tar -xJ -C /opt/blender --strip-components=1 && \
+    ln -s /opt/blender/blender /usr/local/bin/blender && \
+    /opt/blender/blender --version
+
+COPY bin/blender-render /usr/local/bin/blender-render
+RUN chmod +x /usr/local/bin/blender-render
+
+# jemalloc reduces glibc malloc fragmentation; HSA_ENABLE_SDMA=0 mitigates
+# IOMMU TLB-flush storms in the VFIO/KVM passthrough context (same as comfyui/gromacs).
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    HSA_ENABLE_SDMA=0
+
+VOLUME ["/work"]
+WORKDIR /work
+
+ENTRYPOINT ["sleep", "infinity"]

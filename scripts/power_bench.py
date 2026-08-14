@@ -31,7 +31,7 @@ LACT_CONTAINER  = "lact"
 LACT_GPU_ID     = "0"
 
 DEFAULT_SERVER_URL = "http://localhost:8092/v1/chat/completions"
-DEFAULT_MODEL      = "Gemma4-26B-A4B-QAT-Q4_K_M"
+DEFAULT_MODEL      = "Gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking.Q4_K_M"
 DEFAULT_PROMPT     = (
     "Explain the history of mathematics in exhaustive detail covering every major "
     "development, mathematician, and theorem from ancient times to today."

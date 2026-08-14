@@ -1,0 +1,19 @@
+services:
+  grafana-otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: otel-lgtm
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    environment:
+      - GF_PATHS_DATA=/data/grafana
+      - GF_PANELS_DISABLE_SANITIZE_HTML=true
+      - GF_PLUGINS_ENABLE_ALPHA=true
+    volumes:
+      - ./container/grafana:/data/grafana
+      - ./container/prometheus:/data/prometheus
+      - ./container/loki:/data/loki
+    env_file:
+      - .env

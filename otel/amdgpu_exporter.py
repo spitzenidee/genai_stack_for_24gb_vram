@@ -14,6 +14,12 @@ Metrics exposed at  GET /metrics
   amdgpu_core_clock_hz / amdgpu_memory_clock_hz
   amdgpu_fan_rpm
   amdgpu_voltage_millivolts         {sensor="vddgfx|…"}
+
+All metrics also carry a "gpu" label ("egpu"/"igpu"/"unknown") derived from
+the PCI device ID, matching llama-sd's "server" label values (otel/llama_sd.py)
+so Grafana can correlate hardware + inference metrics for the same physical
+GPU via a single $gpu template variable. Override the mapping with the
+GPU_ROLE_MAP env var, format: "744c=egpu,15bf=igpu".
 """
 
 import glob
@@ -22,6 +28,22 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", 9898))
+
+_DEFAULT_GPU_ROLE_MAP = "744c=egpu,15bf=igpu"
+
+
+def _parse_role_map(raw: str) -> dict:
+    roles = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        dev_id, role = pair.split("=", 1)
+        roles[dev_id.strip().lower()] = role.strip()
+    return roles
+
+
+GPU_ROLES = _parse_role_map(os.environ.get("GPU_ROLE_MAP", _DEFAULT_GPU_ROLE_MAP))
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +86,10 @@ def _card_labels(card_path: str) -> dict:
     uevent = _read_str(os.path.join(card_path, "device", "uevent")) or ""
     m = re.search(r"PCI_SLOT_NAME=(\S+)", uevent)
     pci = m.group(1) if m else "unknown"
-    return {"card": card, "pci": pci}
+    m = re.search(r"PCI_ID=\S*:(\S+)", uevent)
+    dev_id = m.group(1).lower() if m else ""
+    gpu = GPU_ROLES.get(dev_id, "unknown")
+    return {"card": card, "pci": pci, "gpu": gpu}
 
 
 def find_hwmon(card_path: str):

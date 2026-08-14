@@ -45,8 +45,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 _DEFAULT_SERVERS = json.dumps([
-    {"url": "http://llama-cpp-cpu:8090", "name": "cpu"},
-    {"url": "http://llama-cpp-vulkan:8092", "name": "vulkan"},
+    {"url": "http://llamacpp-cpu:8090", "name": "cpu"},
+    {"url": "http://llamacpp-egpu:8092", "name": "egpu"},
+    {"url": "http://llamacpp-igpu:8093", "name": "igpu"},
 ])
 
 SERVERS: list[dict] = json.loads(os.environ.get("LLAMA_SERVERS", _DEFAULT_SERVERS))

@@ -29,13 +29,19 @@ RUN pip install --no-cache-dir --pre \
 
 # Clone a pinned release tag — change ARG to upgrade
 # Releases: https://github.com/Comfy-Org/ComfyUI/releases
-ARG COMFYUI_VERSION=v0.21.1
+ARG COMFYUI_VERSION=v0.28.0
 RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
     https://github.com/Comfy-Org/ComfyUI.git /ComfyUI
 
 WORKDIR /ComfyUI
 
 RUN pip install --no-cache-dir -r requirements.txt requests
+
+# ComfyUI-GGUF custom node dependencies
+RUN pip install --no-cache-dir \
+    "gguf>=0.13.0" \
+    sentencepiece \
+    protobuf
 
 # RDNA3 performance flags
 # PYTORCH_CUDA_ALLOC_CONF: gc threshold 0.8 — proactively reclaims unused VRAM blocks

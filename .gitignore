@@ -27,6 +27,42 @@ ollama/id_ed25519.pub
 ollama/models/
 
 # =============================================================================
+# GROMACS — project/work directory (simulation inputs/outputs, generated data);
+# smoketest.sh / stresstest.sh are source-controlled and intentionally tracked
+# =============================================================================
+gromacs/work/*
+!gromacs/work/smoketest.sh
+!gromacs/work/stresstest.sh
+
+# =============================================================================
+# Blender — work directory (scenes, renders, extracted benchmark assets);
+# smoketest.sh / stresstest.sh are source-controlled and intentionally tracked
+# =============================================================================
+# Ignore everything under work, except the two test folders.
+blender/work/*
+!blender/work/_smoketest/
+!blender/work/_stresstest/
+
+# Inside each test folder, keep only the script and downloaded ZIP archives.
+blender/work/_smoketest/*
+!blender/work/_smoketest/smoketest.sh
+!blender/work/_smoketest/*.zip
+blender/work/_stresstest/*
+!blender/work/_stresstest/stresstest.sh
+!blender/work/_stresstest/*.zip
+
+# Ignore extracted benchmark contents recursively (blend files, textures,
+# assets, renders and any subdirectories created by unzipping).
+blender/work/_smoketest/**/
+blender/work/_smoketest/**/*.blend
+blender/work/_smoketest/**/*.png
+blender/work/_smoketest/**/*.jpg
+blender/work/_stresstest/**/
+blender/work/_stresstest/**/*.blend
+blender/work/_stresstest/**/*.png
+blender/work/_stresstest/**/*.jpg
+
+# =============================================================================
 # Misc
 # =============================================================================
 # Environment variable files (whitelist .env.example)
@@ -35,4 +71,7 @@ ollama/models/
 # Background download PID files left by hf_download.sh
 _dl
 tmp.md
+
+# Python bytecode generated when running cleanup helper
+scripts/public-cleanup/__pycache__/
 
