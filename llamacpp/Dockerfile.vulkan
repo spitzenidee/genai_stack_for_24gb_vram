@@ -27,8 +27,9 @@ WORKDIR /app
 # Cache-busting: checks latest release via GitHub API
 ADD "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" latest_release.json
 
-RUN LATEST_TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | grep -oP '"tag_name": "\K[^"]+') && \
+RUN LATEST_TAG=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' latest_release.json | head -n1) && \
     rm -f latest_release.json && \
+    test -n "$LATEST_TAG" || { echo "ERROR: could not parse tag_name from latest_release.json"; exit 1; } && \
     git clone --depth 1 --branch "$LATEST_TAG" https://github.com/ggml-org/llama.cpp.git .
 
 # Build with Vulkan backend

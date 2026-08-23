@@ -25,7 +25,7 @@ receivers:
         - job_name: amdgpu
           scrape_interval: 15s
           static_configs:
-            - targets: ['gpu-exporter:9898']
+            - targets: ['gpu-exporter:${env:GPU_EXPORTER_PORT}']
 
   # ── Docker container resource metrics (CPU, mem, net, I/O per container) ─────
   docker_stats:
@@ -68,6 +68,38 @@ receivers:
         id: extract-container-id
         parse_from: attributes["log.file.path"]
         regex: '/var/log/docker/(?P<container_id>[0-9a-f]+)/'
+      - type: add
+        field: attributes.log.source
+        value: docker
+      - type: add
+        field: resource["service.name"]
+        value: docker
+
+  # ── Host syslog files ────────────────────────────────────────────────────────
+  # Requires volume: /var/log:/var/log/host:ro
+  file_log/host_syslog:
+    include:
+      - /var/log/host/syslog
+      - /var/log/host/auth.log
+      - /var/log/host/kern.log
+    include_file_path: true
+    include_file_name: true
+    start_at: end
+    operators:
+      - type: regex_parser
+        id: parse-rsyslog
+        regex: '^(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<ident>.+?:)\s+(?P<body>.*)$'
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+      - type: add
+        field: attributes.log.source
+        value: host-syslog
+      - type: add
+        field: resource["service.name"]
+        value: host-syslog
+
 
   # ── OTLP receiver — services can push traces/metrics/logs here ───────────────
   # open-webui is configured via OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -75,9 +107,9 @@ receivers:
   otlp:
     protocols:
       grpc:
-        endpoint: 0.0.0.0:${env:OTEL_GRPC_PORT}
+        endpoint: 0.0.0.0:4317
       http:
-        endpoint: 0.0.0.0:${env:OTEL_HTTP_PORT}
+        endpoint: 0.0.0.0:4318
 
 processors:
 
@@ -88,7 +120,7 @@ processors:
     spike_limit_mib: 64
 
   # Enrich all signals with hostname and OS info
-  resourcedetection:
+  resource_detection:
     detectors: [system]
     timeout: 5s
     override: false
@@ -101,7 +133,7 @@ processors:
 exporters:
 
   otlp_grpc:
-    endpoint: "${env:OTEL_GRPC_ENDPOINT}"
+    endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT}
     tls:
       insecure: true
     sending_queue:
@@ -122,12 +154,12 @@ service:
   pipelines:
     metrics:
       receivers: [prometheus, docker_stats, host_metrics]
-      processors: [memory_limiter, resourcedetection, batch]
+      processors: [memory_limiter, resource_detection, batch]
       exporters: [otlp_grpc]
 
     logs:
-      receivers: [file_log]
-      processors: [memory_limiter, resourcedetection, batch]
+      receivers: [file_log, file_log/host_syslog]
+      processors: [memory_limiter, resource_detection, batch]
       exporters: [otlp_grpc]
 
     traces:

@@ -72,6 +72,3 @@ blender/work/_stresstest/**/*.jpg
 _dl
 tmp.md
 
-# Python bytecode generated when running cleanup helper
-scripts/public-cleanup/__pycache__/
-

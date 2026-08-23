@@ -1,7 +1,7 @@
 # ComfyUI — ROCm/HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
-# -complete variant required: --enable-triton-backend and --fast trigger TorchInductor/
+# -full variant required: --enable-triton-backend and --fast trigger TorchInductor/
 # Triton JIT kernel compilation at runtime, which needs hipcc from the full ROCm toolchain.
-FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+FROM rocm/dev-ubuntu-24.04:7.14.0-full
 
 # Ubuntu 24.04 enforces PEP 668 — pip refuses to install into the system site-packages
 # without this flag. Setting it as an env var applies to all subsequent RUN pip calls.
@@ -16,16 +16,16 @@ RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.lis
     libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
-# ROCm 7.2 nightly wheels — the stable index only has cp310/cp311 wheels;
+# ROCm 7.14 nightly wheels — the stable index only has cp310/cp311 wheels;
 # nightly provides cp312 which matches Ubuntu 24.04's system Python.
 # Pinned to last-known-good dates; bump TORCH_DATE (and torchvision/torchaudio
 # versions below) to upgrade. Versions sourced from the running container.
-ARG TORCH_DATE=20260608
+ARG TORCH_DATE=20260805
 RUN pip install --no-cache-dir --pre \
-    "torch==2.13.0.dev${TORCH_DATE}+rocm7.2" \
-    "torchvision==0.28.0.dev20260609+rocm7.2" \
-    "torchaudio==2.11.0.dev20260610+rocm7.2" \
-    --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+    "torch==2.14.0.dev${TORCH_DATE}+rocm7.14" \
+    "torchvision==0.29.0.dev20260808+rocm7.14" \
+    "torchaudio==2.11.0.dev20260808+rocm7.14" \
+    --index-url https://download.pytorch.org/whl/nightly/rocm7.14
 
 # Clone a pinned release tag — change ARG to upgrade
 # Releases: https://github.com/Comfy-Org/ComfyUI/releases

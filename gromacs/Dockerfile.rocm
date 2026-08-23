@@ -1,12 +1,12 @@
 # GROMACS — HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
-# -complete variant required: building GROMACS itself needs hipcc/amdclang++
+# -full variant required: building GROMACS itself needs hipcc/amdclang++
 # from the full ROCm toolchain (same reasoning as comfyui/Dockerfile.rocm).
-FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+FROM rocm/dev-ubuntu-24.04:7.14.0-full
 
-# This image does NOT set ROCM_PATH itself (confirmed empty at runtime) even
-# though /opt/rocm exists (symlink -> /etc/alternatives/rocm -> /opt/rocm-7.2.4)
-# with the compilers underneath — set it explicitly so the cmake flags below
-# resolve correctly.
+# The 7.14.0-full base image already exports ROCM_PATH=/opt/rocm at runtime.
+# /opt/rocm is a directory whose bin/include/lib entries are symlinks through
+# /etc/alternatives. We keep the explicit assignment as a defensive guard so
+# the cmake flags below resolve correctly even if the base image changes.
 ENV ROCM_PATH=/opt/rocm
 
 # Remove stale AMD repo signatures (same fix as in llamacpp/Dockerfile.rocm-builder
