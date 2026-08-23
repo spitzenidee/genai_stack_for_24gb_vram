@@ -8,10 +8,12 @@ compare to published reference numbers.
 
 ## Build gotchas (already fixed in Dockerfile.rocm, kept here for reference)
 
-1. **`ROCM_PATH` isn't set by the base image.** `rocm/dev-ubuntu-24.04:7.2.4-complete`
-   doesn't export it despite `/opt/rocm` existing — cmake compiler paths
-   silently resolved to garbage (`/llvm/bin/clang`) until we set
-   `ENV ROCM_PATH=/opt/rocm` explicitly.
+1. **`ROCM_PATH` is exported by the base image, but we keep it explicit.**
+   `rocm/dev-ubuntu-24.04:7.14.0-full` already sets `ROCM_PATH=/opt/rocm`
+   (`/opt/rocm` is a directory with `bin`, `include`, `lib`, etc. symlinks
+   through `/etc/alternatives`). The explicit `ENV ROCM_PATH=/opt/rocm` in
+   the Dockerfile is a defensive guard so compiler paths don't silently
+   resolve to garbage (`/llvm/bin/clang`) if the variable ever disappears.
 2. **`-DGMX_BUILD_OWN_FFTW=ON` is incompatible with the Ninja generator**
    ("Cannot build FFTW3 automatically ... with ninja"). Use the default
    Makefiles generator (`cmake ..` without `-GNinja`) + `make -j$(nproc)`.

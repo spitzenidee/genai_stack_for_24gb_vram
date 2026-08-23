@@ -8,7 +8,7 @@ Writes one CSV row per run; datetime is embedded in the output filename.
 Usage examples:
   python3 power_bench.py
   python3 power_bench.py --min-watts 260 --max-watts 303 --step-watts 5 --runs 7
-  python3 power_bench.py --output /tmp/my_bench.csv --settle 10
+  python3 power_bench.py --output /tmp/power_bench.csv --settle 10
 """
 
 import argparse

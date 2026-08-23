@@ -16,7 +16,7 @@ CONFIG_FILE="${1:-$SCRIPT_DIR/bench_configs.ini}"
 DOCKERFILE_DIR="$SCRIPT_DIR"
 
 # Model to benchmark (tiny = fast load, representative for t/s comparison)
-MODEL_DIR="/home/spitzem/docker/genai_stack/hfmodels"
+MODEL_DIR="${MODEL_DIR:-/home/<my_user>/docker/genai_stack/hfmodels}"
 MODEL_FILE="granite-4.0-h-tiny-Q4_K_M.gguf"
 
 # Container settings (match docker-compose.yml)

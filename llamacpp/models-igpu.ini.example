@@ -2,9 +2,13 @@ version = 1
 
 ; ── Global defaults inherited by every model ──────────────────────────────────
 ; Mirrors models-egpu.ini.example's tuning philosophy. n-gpu-layers stays at 99
-; (full offload) — the 16 GB budget constraint is enforced by only listing
-; models below whose weights + KV cache (at the given -c) fit entirely in
-; VRAM, not by reducing the offloaded layer count.
+; (full offload). The 16 GB carve-out is a performance target, not a hard
+; limit: the 780M's "VRAM" is part of the same physical DDR5 system DRAM,
+; so weights + KV cache that spill past it are not an error — they keep
+; using the same system memory. Models that fit comfortably inside the
+; carve-out are preferred for best speed because spillover adds allocation
+; /mapping overhead and CPU/VMM contention, not because the memory itself is
+; slower.
 [*]
 cache-type-k = q8_0
 cache-type-v = q8_0

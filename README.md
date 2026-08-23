@@ -139,6 +139,12 @@ Always-on services (all modes): `lact`, `gpu-exporter`, `otel-collector`, `llama
 The iGPU service uses the Radeon 780M — separate hardware with its own
 system-memory carve-out — so it does not contend for eGPU VRAM and is
 exempt from the mode switch: once started, it keeps running in every mode.
+Because that carve-out is simply a reservation from the host's system DRAM,
+a model whose weights + KV cache spill past the reserved "VRAM" limit does
+not OOM: allocations continue to come from the same physical DDR5 system
+memory via GTT. The memory itself is not slower — the iGPU already uses
+system DRAM — but performance may degrade due to allocation/mapping
+overhead and contention with the CPU/VMM for that memory.
 
 ```bash
 make            # show help + current status
@@ -176,7 +182,11 @@ cp .env.example .env
 
 docker compose build
 make llama
+```
 
+Then:
+
+```bash
 # chat endpoint
 curl http://localhost:8092/v1/models
 
@@ -187,6 +197,21 @@ make comfyui
 My recommendation is to start testing this stack either by Gromacs or Blender (one followed by the other) by firing off both the respective smoketests and stresstests. This is a mostly non-interactive check if the compute of both components **really** takes place on the eGPU. You can monitor the eGPU (and iGPU) load in a parallel shell session via the `gpu-monitor.sh` script. In case this keeps hovering around zero, then for sure something is wrong. In both cases it's expected to exceed 90% GPU load after a short time.
 
 For a more interactive test I recommend the `llama` mode to be activated via `make llama`. This will start both `llamacpp-egpu` and `open-webui` (`llamacpp-igpu` is always-on, in all cases). By then using Open-WebUI via a webbrowser and setting up both eGPU and iGPU llama instances as model provider connections you will be able to interactively test both llama instances with the LLM of your choice (and get some numbers on prompt processing and token generation speeds from Open-WebUI).
+
+**Note:** `docker compose build` alone does not refresh the llama.cpp version in
+the eGPU image — the ROCm compile lives in the separate
+`llama-rocm-builder:latest` image (see Inference → Build). Use the
+`rebuild-genai-llama` shell alias to rebuild builder + both llama services in
+the correct order:
+
+```bash
+alias rebuild-genai-llama="
+  cd /home/<my_user>/docker/genai_stack &&
+  docker build --no-cache -f llamacpp/Dockerfile.rocm-builder -t llama-rocm-builder:latest llamacpp &&
+  docker compose build llamacpp-egpu llamacpp-igpu &&
+  docker compose up -d --force-recreate llamacpp-egpu llamacpp-igpu
+"
+```
 
 ## Download a model from Huggingface and move to the model folder
 
@@ -214,16 +239,29 @@ which model is available in which llama.cpp instance. Only LLMs configured in
 either `models-egpu.ini` or `models-igpu.ini` will be available, all others 
 will not be exposed.
 
-## Inference: llama.cpp (Vulkan/RADV)
+## Inference: llama.cpp (ROCm eGPU / Vulkan iGPU)
 
 Two `llama-server` instances serve models independently:
 
-| Service          | GPU   | Image build                        | Port |
-|------------------|-------|-------------------------------------|------|
-| `llamacpp-egpu`  | eGPU  | `llamacpp/Dockerfile.vulkan`        | 8092 |
-| `llamacpp-igpu`  | iGPU  | same image, different render node   | 8093 |
+| Service          | GPU   | Backend | Image build                                        | Port |
+|------------------|-------|---------|----------------------------------------------------|------|
+| `llamacpp-egpu`  | eGPU  | ROCm/HIP | `llamacpp/Dockerfile.rocm` on `Dockerfile.rocm-builder` | 8092 |
+| `llamacpp-igpu`  | iGPU  | Vulkan/RADV | `llamacpp/Dockerfile.vulkan`                    | 8093 |
 
-### Build (`Dockerfile.vulkan`)
+### Build: eGPU (`Dockerfile.rocm-builder` + `Dockerfile.rocm`)
+
+The eGPU build is split into two stages to keep iteration fast:
+
+- `Dockerfile.rocm-builder` — the expensive stage (~20+ min): base
+  `rocm/dev-ubuntu-24.04:7.14.0-full`, clones the latest tagged llama.cpp
+  release, compiles with `GGML_HIP=ON` for `AMDGPU_TARGETS=gfx1100`
+  (Navi 31 / RX 7900 XTX) with `GGML_HIP_MMQ_MFMA` + `GGML_HIP_GRAPHS`.
+  Rebuild only when llama.cpp should be updated:
+  `docker build --no-cache -f llamacpp/Dockerfile.rocm-builder -t llama-rocm-builder:latest llamacpp`
+- `Dockerfile.rocm` — thin runtime stage on top of the cached builder image
+  (seconds to rebuild).
+
+### Build: iGPU (`Dockerfile.vulkan`)
 
 - Multi-stage Ubuntu 24.04 image.
 - Builds the latest tagged `llama.cpp` release from GitHub.
@@ -232,18 +270,39 @@ Two `llama-server` instances serve models independently:
 - `GGML_NATIVE=OFF` so the binary is portable across host CPUs.
 - Runtime image installs `mesa-vulkan-drivers` and points the loader to
   `/usr/share/vulkan/icd.d/radeon_icd.json`.
+- The iGPU (Radeon 780M, gfx1103) deliberately stays on Vulkan: ROCm does not
+  officially support gfx1103, and Vulkan handles the UMA carve-out well.
+  The carve-out is a performance target, not a hard limit — weights/KV that
+  spill past it are allocated from the same physical DDR5 system DRAM via
+  GTT. They remain usable; the iGPU already talks to system memory, so there
+  is no separate VRAM bus to fall back from. Performance may still degrade
+  due to allocation/mapping overhead and CPU/VMM contention.
 
-Additional build files exist in `llamacpp/` but are not wired into the
-active compose profiles:
-- `Dockerfile.rocm-builder` — cached ROCm/GGML_HIP build stage;
-- `Dockerfile.rocm` — thin runtime wrapper on top of the builder;
-- `Dockerfile.cpu` — AVX-512/VNNI-tuned CPU-only build.
+`Dockerfile.cpu` (AVX-512/VNNI CPU-only build) also exists in `llamacpp/` but
+is not wired into any compose profile.
 
-**Note:** Similar to the comfyUI CPU-only Docker image I also started out with llama.cpp on the CPU,
-then with ROCm on the eGPU, then did a quick benchmark of the ROCm build against Vulkan. I found that 
-token generation speeds is ~20% higher for at least small to medium context sizes and decided to stick
-with Vulkan, also for the vastly smaller image size. Should I get note on ROCm becoming the better overall
-basis for llama.cpp in the future I may switch again (and then have a working ROCm image as a starting point).
+**Note — why the eGPU moved from Vulkan to ROCm (2026-08):** I started with
+llama.cpp on CPU, moved to ROCm, then switched to Vulkan because token
+generation measured ~20% faster at small/medium context sizes and the image
+is vastly smaller. That decision was reversed after Qwen3.6/3.8 models showed
+severe, reproducible corruption on the Vulkan/RADV backend that did not occur
+on ROCm (HIP) or CPU with identical settings: mistyped tokens in tool calls,
+ignored requests, invented tasks, and intermittent GPU hangs
+(`vk::Queue::submit: ErrorDeviceLost`). Relevant upstream issues:
+[ggml-org/llama.cpp#26744](https://github.com/ggml-org/llama.cpp/issues/26744)
+(Vulkan flash-attn coopmat shader lets stale KV cells influence output),
+[#26195](https://github.com/ggml-org/llama.cpp/issues/26195) (Vulkan FA +
+quantized V cache garbles head_dim=256 models — the Qwen3.x family),
+[#24812](https://github.com/ggml-org/llama.cpp/issues/24812) (Qwen on RADV:
+clustered garbage in warm streaming sessions),
+[#23088](https://github.com/ggml-org/llama.cpp/issues/23088) (MTP speculative
+decoding garbled on Vulkan/RADV at ~0.7% acceptance vs 81% on HIP, same GPU),
+[#21446](https://github.com/ggml-org/llama.cpp/issues/21446) (Qwen on Vulkan:
+`ErrorDeviceLost` on RX 7900 XTX). On ROCm, the same Qwen3.8 config runs
+correctly, and with its embedded MTP draft head
+(`spec-type = draft-mtp,ngram-mod`, 80–95% acceptance) reaches 40+ t/s —
+faster than the Vulkan setup ever was. A lact undervolt (`-150 mV`) was
+investigated as a possible cause of the GPU hangs and ruled out.
 
 ### Configuration
 
@@ -301,8 +360,8 @@ Two build files exist:
 
 ### ROCm image
 
-- Base: `rocm/dev-ubuntu-24.04:7.2.4-complete`.
-- PyTorch: nightly ROCm 7.2 wheels (`torch==2.13.0.dev…+rocm7.2`).
+- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
+- PyTorch: nightly ROCm 7.14 wheels (`torch==2.14.0.dev…+rocm7.14`).
 - ComfyUI: pinned release tag `v0.28.0`.
 - Extra Python deps for ComfyUI-GGUF custom nodes: `gguf>=0.13.0`,
   `sentencepiece`, `protobuf`.
@@ -344,8 +403,9 @@ the rest of the package.
 
 ### Build (`gromacs/Dockerfile.rocm`)
 
-- Base: `rocm/dev-ubuntu-24.04:7.2.4-complete`.
-- `ENV ROCM_PATH=/opt/rocm` (the base image does not set it).
+- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
+- `ENV ROCM_PATH=/opt/rocm` (base image already exports it; kept explicit as a
+  defensive guard).
 - GPU back end: `-DGMX_GPU=HIP -DGMX_HIP_TARGET_ARCH=gfx1100`.
 - SIMD: `-DGMX_SIMD=AVX2_256` (auto-detected AVX-512 segfaults on Zen4 in
   this build).
@@ -437,7 +497,7 @@ Step 11900: Run time exceeded 0.247 hours, will terminate the run within 100 ste
 
 ### Build (`blender/Dockerfile.rocm`)
 
-- Base: `rocm/dev-ubuntu-24.04:7.2.4-complete`.
+- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
 - Downloads the official Blender Linux tarball.
 - Installs ROCm runtime libraries and graphics/font/X11 deps required by
   the official binary.
@@ -574,7 +634,7 @@ privileged container so it can write sysfs for power/voltage/fan control.
 `scripts/power_bench.py` uses `docker exec lact lact cli` to sweep the GPU
 power limit and record llama.cpp tokens/s to CSV.
 
-The `config.yaml.example` resembles my stable setup. I tested an undervolt of -160mV but am not quite sure that it really is 100% stable, so I settled on -150mV incl power-capping the eGPU at 265W for a better power efficiency sweet-spot (going higher we'll approach diminishing returns quickly).
+The `config.yaml.example` resembles my stable setup. I tested an undervolt of -160mV but am not quite sure that it really is 100% stable, so I settled on -150mV incl power-capping the eGPU at 265W for a better power efficiency sweet-spot (going higher we'll approach diminishing returns quickly). Note: during the Vulkan→ROCm investigation (see Inference section) the -150mV undervolt was explicitly tested as a possible cause of GPU hangs and ruled out — it is stable for this workload.
 
 ## Utility scripts
 
@@ -612,6 +672,18 @@ ls -l /sys/class/drm/
 
 ## Troubleshooting
 
+- **Qwen3.x models corrupt output on the Vulkan backend** (mistyped tool-call
+  arguments, ignored instructions, invented tasks) or crash the GPU
+  (`decode() failed: vk::Queue::submit: ErrorDeviceLost`). This is a known
+  RADV/llama.cpp issue class — see the linked upstream issues in the
+  Inference section. That is why `llamacpp-egpu` runs ROCm; do not move the
+  eGPU service back to `Dockerfile.vulkan` without re-testing Qwen-family
+  models specifically.
+- **Qwen3.8 residual quirk (accepted):** with `spec-type = draft-mtp`, the
+  first tokens of a response occasionally contain typos (e.g. folder names)
+  which the model reliably self-corrects within its thinking chain. Errors
+  cluster at response start (cold MTP draft context); `cache-reuse = 0` was
+  tested and ruled out. If it ever worsens, test `spec-type = none`.
 - **IOMMU TLB-flush storms (VFIO/KVM passthrough).** All ROCm services set
   `HSA_ENABLE_SDMA=0`; without it, SDMA usage triggers severe TLB-flush
   stalls.

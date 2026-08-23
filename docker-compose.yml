@@ -18,19 +18,27 @@ services:
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - 'AIOHTTP_CLIENT_TIMEOUT=7200'
       - 'FORWARDED_ALLOW_IPS=172.16.0.0/12'
+      - 'ENABLE_OTEL=true'
+      - 'ENABLE_OTEL_TRACES=true'
+      # No ENABLE_OTEL_METRICS: the collector's metrics pipeline has no OTLP
+      # receiver (metrics are scraped via prometheus/docker_stats/host_metrics),
+      # so pushed gRPC metrics would fail with UNIMPLEMENTED.
       - 'OTEL_SERVICE_NAME=open-webui'
-      - 'OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318'
-      - 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
+      # Open WebUI defaults to the gRPC exporter (docs/reference/monitoring/otel.md):
+      # point at collector :4317 and mark the connection insecure (plaintext OTLP).
+      - 'OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317'
+      - 'OTEL_EXPORTER_OTLP_INSECURE=true'
     restart: unless-stopped
 
   llamacpp-egpu:
     build:
       context: ./llamacpp
-      dockerfile: Dockerfile.vulkan
-    image: llama-cpp-vulkan:latest
+      dockerfile: Dockerfile.rocm
+    image: llama-cpp-rocm:latest
     container_name: llamacpp-egpu
     profiles: ["llama"]
     devices:
+      - /dev/kfd:/dev/kfd
       - ${GPU_RENDER_DEVICE}:${GPU_RENDER_DEVICE}
       - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
     group_add:
@@ -48,6 +56,10 @@ services:
       memlock:
         soft: -1
         hard: -1
+    environment:
+      # Same as comfyui-rocm: avoids amdgpu_tlb_fence_work / svm_range_restore_work
+      # workqueue storms under VFIO/KVM passthrough on kernel 6.17.
+      - HSA_ENABLE_SDMA=0
     command: >
       --models-preset /config/models.ini
       --host 0.0.0.0
@@ -61,10 +73,15 @@ services:
 
   # Radeon 780M iGPU (Phoenix, gfx1103) — always-on, independent of the
   # eGPU/gromacs/blender work-mode switch (separate hardware, no VRAM
-  # contention with the eGPU). Same Vulkan image as llamacpp-egpu: RADV
-  # selects the target device at runtime via the bind-mounted render node,
-  # no arch-specific build needed. Only serve models whose weights + KV
-  # cache fit entirely within the ~16 GB UMA carve-out (see models-igpu.ini).
+  # contention with the eGPU). Stays on Vulkan deliberately (unlike the eGPU,
+  # which runs ROCm): ROCm does not officially support gfx1103, and RADV
+  # handles the UMA carve-out well. RADV selects the target device at runtime
+  # via the bind-mounted render node, no arch-specific build needed. The
+  # ~16 GB UMA carve-out is a performance target, not a hard limit: weights +
+  # KV cache that spill past it still use the same physical DDR5 system DRAM
+  # via GTT (there is no separate VRAM bus), so they remain usable but may
+  # see allocation/mapping overhead and CPU/VMM contention — see
+  # models-igpu.ini.
   llamacpp-igpu:
     build:
       context: ./llamacpp
@@ -136,16 +153,20 @@ services:
   otel-collector:
     # NOTE: gpu-exporter omitted from depends_on intentionally — OTel handles
     # a temporarily unavailable scrape target gracefully without blocking startup.
-    image: otel/opentelemetry-collector-contrib:latest
+    image: otel/opentelemetry-collector-contrib:0.158.0
     container_name: otel-collector
+    hostname: genaivm   # prevent container ID from appearing as host.name in Grafana
     environment:
       - LLAMA_SD_PORT=${LLAMA_SD_PORT}
     group_add:
       - "988"   # docker group — required for docker_stats receiver + resourcedetection
+      - "4"     # adm group — required to read /var/log/syslog, auth.log, kern.log
     volumes:
       - ${APP_ROOT}/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
       - /var/lib/docker/containers:/var/log/docker:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host logs: classic syslog files
+      - /var/log:/var/log/host:ro
     ports:
       - "${OTEL_GRPC_PORT}:4317"   # OTLP gRPC — receive push traces from services on this host
       - "${OTEL_HTTP_PORT}:4318"   # OTLP HTTP

@@ -1,6 +1,6 @@
 # Blender 5.2 LTS — headless Cycles/HIP rendering for RDNA3 (gfx1100 / RX 7900 XTX)
 # Build context: ./blender (sibling to this Dockerfile)
-FROM rocm/dev-ubuntu-24.04:7.2.4-complete
+FROM rocm/dev-ubuntu-24.04:7.14.0-full
 
 ENV ROCM_PATH=/opt/rocm
 
