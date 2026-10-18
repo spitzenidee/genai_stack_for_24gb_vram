@@ -1,0 +1,21 @@
+#!/bin/sh
+# tmd — tasks.md board CLI. Runs tmd.py (python3 stdlib, no host deps) in a
+# transient python:3.12-slim container on the host network, so it works in
+# every stack mode against localhost. One-time: docker pull python:3.12-slim
+#
+# Usage: tmd <list|get|new-lane|new-card|edit|append|move|claim|to-top|reorder|rm|img> ...
+#        (content commands read from stdin:  tmd edit Lane/card.md < file)
+# TASKS_MD_URL overrides the board URL (default http://localhost:8090); it is
+# passed into the container only when set.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+# Board Log timestamps are local time: read the host's IANA zone dynamically
+# (auto-follows `timedatectl set-timezone`) and inject it into the transient
+# container. Fallback UTC guards a non-symlink /etc/localtime.
+TZ="$(readlink -f /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p')"
+[ -n "$TZ" ] || TZ="UTC"
+ENV_ARGS="-e TZ=${TZ}"
+[ -n "${TASKS_MD_URL:-}" ] && ENV_ARGS="$ENV_ARGS -e TASKS_MD_URL=${TASKS_MD_URL}"
+# shellcheck disable=SC2086
+exec docker run --rm -i --network host $ENV_ARGS \
+  -v "${DIR}/tmd.py":/tools/tmd.py:ro \
+  python:3.12-slim python3 /tools/tmd.py "$@"

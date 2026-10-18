@@ -4,7 +4,8 @@
 # contexts): llama | comfyui | gromacs | blender.
 # llamacpp-igpu runs on the iGPU and is started in llama/comfyui modes;
 # it does not contend for eGPU VRAM.
-# Always-on regardless of mode: lact, gpu-exporter, otel-collector, llama-sd.
+# Always-on regardless of mode: lact, gpu-exporter, otel-collector, llama-sd,
+# tasks-md.
 
 MAKEFILE_DIR := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 SWITCH := $(MAKEFILE_DIR)scripts/switch-mode.sh

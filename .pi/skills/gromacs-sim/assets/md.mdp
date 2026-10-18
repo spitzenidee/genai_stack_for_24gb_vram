@@ -1,0 +1,39 @@
+; --- Production NPT (Phase 6) ---
+integrator  = md
+nsteps      = <<<NSTEPS:5000000>>>      ; 10 ns at 2 fs
+dt          = 0.002
+
+; Temperature coupling
+tcoupl      = v-rescale
+tau-t       = 0.1 0.1
+ref-t       = <<<REF_T:300>>> <<<REF_T:300>>>
+tc-grps     = Protein Non-Protein
+
+; Pressure coupling
+pcoupl      = C-rescale
+pcoupltype  = isotropic
+tau-p       = 2.0
+compressibility = 4.5e-5
+ref-p       = <<<REF_P:1.0>>>
+; refcoord-scaling NOT needed (no position restraints in production)
+
+; Neighbor / electrostatics
+cutoff-scheme = Verlet
+nstlist     = 10
+rvdw        = 1.0
+rcoulomb    = 1.0
+coulombtype = PME
+pme-order   = 4
+fourierspacing = 0.12
+
+; Constraints
+constraints = h-bonds
+
+; Remove COM motion
+nstcomm     = 1000
+
+; Output (2 ps spacing at 2 fs)
+nstenergy   = 1000
+nstlog      = 1000
+nstxout-compressed = 1000   ; xtc every 2 ps (enough for most analysis)
+; checkpoint interval: mdrun -cpt <minutes> (nstcheckpoint is obsolete in 2026.3)

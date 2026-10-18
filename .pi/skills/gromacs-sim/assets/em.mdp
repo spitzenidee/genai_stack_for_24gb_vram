@@ -1,0 +1,18 @@
+; --- Energy minimization (Phase 4) ---
+integrator  = steep        ; steepest descent (robust). Use 'cg'/'l-bfgs' for large systems.
+nsteps      = <<<NSTEPS:50000>>>        ; cap; EM usually converges earlier
+emtol       = 10           ; max force tolerance, kJ/mol/nm. 1e-4 only for normal-mode analysis.
+emstep      = 0.01         ; initial step, nm
+
+; Neighbor / electrostatics (match your cutoffs; see 01.3 box rule)
+cutoff-scheme = Verlet
+nstlist     = 10
+rvdw        = 1.0
+rcoulomb    = 1.0
+coulombtype = PME
+pme-order   = 4
+fourierspacing = 0.12
+
+; No temperature/pressure coupling in EM
+tcoupl      = no
+pcoupl      = no

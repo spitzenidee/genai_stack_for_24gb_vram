@@ -1,0 +1,53 @@
+{
+  "_comment": "Curated gap-fill data NOT present in AAindex. ALL values below are FACT-CHECKED against the cited sources (fetched and verified 2026-07), not from memory. Full attribution in SOURCES.md (this skill's directory, section 'Curated gap-fill'). pKa: IMGT (Asp/Glu/Lys/Arg/His) + Wikipedia (Cys/Tyr). H-bond donor/acceptor counts: IMGT Table 3 (atom counts). Net side-chain charge: consistent with AAindex1 KLEP840101 (Klein, Kanehisa & DeLisi 1984; PMID 6547351).",
+  "aa": "ARNDCQEGHILKMFPSTWYV",
+
+  "pka_sidechain": {
+    "_source": "FACT-CHECKED. IMGT (https://www.imgt.org/IMGTeducation/Aide-memoire/_UK/aminoacids/charge/index.html): Asp 3.9, Glu 4.2, Lys 10.5, Arg 12.5, His 6.0. Wikipedia (https://en.wikipedia.org/wiki/Cysteine): Cys thiol 8.33. Wikipedia (https://en.wikipedia.org/wiki/Amino_acid): Tyr phenolic ~10. null = no ionizable side chain.",
+    "A": null, "R": 12.5, "N": null, "D": 3.9, "C": 8.33,
+    "Q": null, "E": 4.2, "G": null, "H": 6.0, "I": null,
+    "L": null, "K": 10.5, "M": null, "F": null, "P": null,
+    "S": null, "T": null, "W": null, "Y": 10.0, "V": null
+  },
+  "pka_notes": {
+    "R": "Guanidinium, effectively always protonated (+1) at physiological pH; pKa shifts are rare.",
+    "K": "Primary amine, +1 at physiological pH; slightly weaker base than Arg.",
+    "H": "Imidazole, pKa near physiological pH -> protonation state is pH-sensitive; the classic 'switchable' charge. ~10% protonated at pH 7 (Wikipedia).",
+    "D": "Carboxylate, -1 at physiological pH.",
+    "E": "Carboxylate, -1 at physiological pH.",
+    "C": "Thiol, neutral at physiological pH; can be deprotonated (thiolate) in specific active-site environments (e.g., cysteine proteases).",
+    "Y": "Phenol, neutral at physiological pH; weak acid.",
+    "_nulls": "The 13 null residues are NOT ionized at physiological pH (so null is functionally correct for charge reasoning). Two sub-cases: (a) 9 are truly non-ionizable - no acidic/basic side-chain proton at all: A, G, V, L, I, M, F, W, P. (b) 4 are weakly acidic at very high pKa (~13-15) and thus uncharged at physiological pH: S, T (hydroxyl) and N, Q (amide). They are polar but uncharged.",
+    "_caveat": "In proteins these values shift substantially (especially His, Cys, Asp, Glu) depending on local environment. Discussed in Stryer (2015) and Lehninger et al. (2017)."
+  },
+
+  "hbond_donors": {
+    "_source": "FACT-CHECKED. IMGT Table 3 (https://www.imgt.org/IMGTeducation/Aide-memoire/_UK/aminoacids/charge/index.html): number of hydrogen-bond DONOR ATOMS in the side chain. (Alternative capacity-based count: AAindex1 FAUJ880109, Fauchere et al. 1988, PMID 3209351, gives R=4, K=2, etc.)",
+    "A": 0, "R": 3, "N": 1, "D": 0, "C": 0,
+    "Q": 1, "E": 0, "G": 0, "H": 2, "I": 0,
+    "L": 0, "K": 1, "M": 0, "F": 0, "P": 0,
+    "S": 1, "T": 1, "W": 1, "Y": 1, "V": 0
+  },
+  "hbond_acceptors": {
+    "_source": "FACT-CHECKED. IMGT Table 3 (https://www.imgt.org/IMGTeducation/Aide-memoire/_UK/aminoacids/charge/index.html): number of hydrogen-bond ACCEPTOR ATOMS in the side chain. Note: counts are protonation-state dependent; e.g. protonated Arg/Lys are poor acceptors (0).",
+    "A": 0, "R": 0, "N": 1, "D": 2, "C": 0,
+    "Q": 1, "E": 2, "G": 0, "H": 2, "I": 0,
+    "L": 0, "K": 0, "M": 0, "F": 0, "P": 0,
+    "S": 1, "T": 1, "W": 0, "Y": 1, "V": 0
+  },
+  "hbond_notes": {
+    "R": "Guanidinium: 3 N-H donor atoms (NE, NH1, NH2) + planar bidentate geometry; the amine N is a very weak acceptor (counted 0 when protonated). Forms strong, directionally flexible salt bridges/H-bonds with carboxylates, phosphates, and carbonyls.",
+    "K": "Primary amine: 1 donor atom (NZ, up to 3 N-H), single-directional; salt bridges are weaker and less geometrically flexible than Arg's.",
+    "H": "Imidazole: 2 donor/acceptor atoms (ND1, NE2) when neutral; loses acceptor character when protonated (donor only).",
+    "D": "Carboxylate: 2 acceptor atoms (OD1, OD2), 1 donor; bidentate binding to cations.",
+    "E": "Carboxylate: 2 acceptor atoms (OE1, OE2), 1 donor."
+  },
+
+  "partial_charge_sidechain": {
+    "_source": "Net side-chain charge at pH 7.4. Consistent with AAindex1 entry KLEP840101 (Klein, P., Kanehisa, M. and DeLisi, C. 1984; PMID 6547351) and IMGT (5 charged side chains at pH 7: D, E negative; K, R, H positive). His counted as 0 here (mixture of ~10% protonated at pH 7 per Wikipedia; use pka_sidechain for context).",
+    "A": 0.0, "R": 1.0, "N": 0.0, "D": -1.0, "C": 0.0,
+    "Q": 0.0, "E": -1.0, "G": 0.0, "H": 0.0, "I": 0.0,
+    "L": 0.0, "K": 1.0, "M": 0.0, "F": 0.0, "P": 0.0,
+    "S": 0.0, "T": 0.0, "W": 0.0, "Y": 0.0, "V": 0.0
+  }
+}
