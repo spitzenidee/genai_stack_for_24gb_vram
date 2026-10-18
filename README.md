@@ -253,7 +253,7 @@ Two `llama-server` instances serve models independently:
 The eGPU build is split into two stages to keep iteration fast:
 
 - `Dockerfile.rocm-builder` — the expensive stage (~20+ min): base
-  `rocm/dev-ubuntu-24.04:7.14.0-full`, clones the latest tagged llama.cpp
+  `rocm/dev-ubuntu-24.04:7.14.1-full`, clones the latest tagged llama.cpp
   release, compiles with `GGML_HIP=ON` for `AMDGPU_TARGETS=gfx1100`
   (Navi 31 / RX 7900 XTX) with `GGML_HIP_MMQ_MFMA` + `GGML_HIP_GRAPHS`.
   Rebuild only when llama.cpp should be updated:
@@ -341,12 +341,12 @@ Started only in `llama` mode.
 
 ### Configure iGPU and eGPU endpoints in OpenWebUI
 
-Both llama-server instances (iGPU, eGPU) must be configured as "OpenAI API" endpoints as follows (IP `192.168.1.123` is used an example here, use the IP adress your own VM / machine is running at):
+Both llama-server instances (iGPU, eGPU) must be configured as "OpenAI API" endpoints as follows (IP `192.0.2.123` is used as an example here — RFC 5737 documentation range — use the IP address your own VM / machine is running at):
 
 * eGPU
-  * `http://192.168.1.123:8092/v1`
+  * `http://192.0.2.123:8092/v1`
 * iGPU
-  * `http://192.168.1.123:8093/v1`
+  * `http://192.0.2.123:8093/v1`
 
 In the connection config you can add a tag and/or a prefix, which helps dearly with identifying where a model will be served from. E.g. if you assign the prefix `igpu` to the iGPU endpoint, then in e.g. the chat window all models exposed by this endpoint will be available as `igpu.<modelname>`.
 
@@ -360,7 +360,7 @@ Two build files exist:
 
 ### ROCm image
 
-- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
+- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
 - PyTorch: nightly ROCm 7.14 wheels (`torch==2.14.0.dev…+rocm7.14`).
 - ComfyUI: pinned release tag `v0.28.0`.
 - Extra Python deps for ComfyUI-GGUF custom nodes: `gguf>=0.13.0`,
@@ -403,7 +403,7 @@ the rest of the package.
 
 ### Build (`gromacs/Dockerfile.rocm`)
 
-- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
+- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
 - `ENV ROCM_PATH=/opt/rocm` (base image already exports it; kept explicit as a
   defensive guard).
 - GPU back end: `-DGMX_GPU=HIP -DGMX_HIP_TARGET_ARCH=gfx1100`.
@@ -497,7 +497,7 @@ Step 11900: Run time exceeded 0.247 hours, will terminate the run within 100 ste
 
 ### Build (`blender/Dockerfile.rocm`)
 
-- Base: `rocm/dev-ubuntu-24.04:7.14.0-full`.
+- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
 - Downloads the official Blender Linux tarball.
 - Installs ROCm runtime libraries and graphics/font/X11 deps required by
   the official binary.
@@ -699,3 +699,13 @@ ls -l /sys/class/drm/
 - **VRAM OOM or context-switch stalls.** Two heavy GPU workloads are
   competing for the eGPU — switch to a single mode with `make <mode>`
   instead of starting services manually.
+- **Qwen-family models corrupt file paths in tool calls / reasoning.** If
+  paths that previously appeared in context get mangled
+  (`homelab` → `hommelab`, `ARCHITECTURE.md` → `ARCHITECTURD.md`, etc.),
+  check the model's `models.ini` section for `dry-*` parameters. DRY
+  (Don't Repeat Yourself) penalizes repeated token sequences, which is
+  useful for prose but actively harmful for exact strings like file paths,
+  JSON keys, and shell commands. Remove or comment out `dry-multiplier`,
+  `dry-base`, and `dry-allowed-length` for Qwen-family (and other
+  agentic/tool-calling) models. If removing DRY causes repetition loops,
+  raise `repeat-penalty` slightly (e.g. from `1.0` to `1.01`) instead.

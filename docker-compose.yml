@@ -8,6 +8,7 @@ services:
     container_name: open-webui
     volumes:
       - ${APP_ROOT}/open-webui:/app/backend/data
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "${OPEN_WEBUI_PORT}:8080"
     ulimits:
@@ -34,7 +35,10 @@ services:
     build:
       context: ./llamacpp
       dockerfile: Dockerfile.rocm
-    image: llama-cpp-rocm:latest
+    # LLAMA_EGPU_IMAGE (in .env): llama-cpp-rocm:latest (vanilla) |
+    # llama-cpp-rocm:rdna (rdna-boosts prototype — build/switch docs in
+    # llamacpp/Dockerfile.rocm-builder-rdna)
+    image: ${LLAMA_EGPU_IMAGE:-llama-cpp-rocm:latest}
     container_name: llamacpp-egpu
     profiles: ["llama"]
     devices:
@@ -46,7 +50,15 @@ services:
       - "${VIDEO_GID}"    # video
     volumes:
       - ${APP_ROOT}/llamacpp/hfmodels:/models
+      # models-egpu.ini is a SYMLINK (docker follows it at container
+      # creation): -> models-egpu-vanilla.ini (11 models, vanilla-safe) by
+      # default, or -> models-egpu-rdna.ini (12 models, incl. the
+      # draft-mtp-adaptive entry that only the rdna image's patched binary
+      # can parse). Re-point it BEFORE `docker compose up -d` when switching
+      # images; the bench script (scripts/bench_egpu_ab.py) does this
+      # automatically.
       - ${APP_ROOT}/llamacpp/models-egpu.ini:/config/models.ini:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "${LLAMA_EGPU_PORT}:8092"
     shm_size: '256m'
@@ -60,14 +72,13 @@ services:
       # Same as comfyui-rocm: avoids amdgpu_tlb_fence_work / svm_range_restore_work
       # workqueue storms under VFIO/KVM passthrough on kernel 6.17.
       - HSA_ENABLE_SDMA=0
+      - LD_LIBRARY_PATH=/usr/local/lib:/opt/rocm/lib
     command: >
       --models-preset /config/models.ini
       --host 0.0.0.0
       --port 8092
       --models-max ${LLAMA_EGPU_MODELS_MAX}
       -cb
-      -b ${LLAMA_EGPU_BATCH_SIZE}
-      -ub ${LLAMA_EGPU_UBATCH_SIZE}
       --metrics
     restart: unless-stopped
 
@@ -97,6 +108,7 @@ services:
     volumes:
       - ${APP_ROOT}/llamacpp/hfmodels:/models
       - ${APP_ROOT}/llamacpp/models-igpu.ini:/config/models.ini:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "${LLAMA_IGPU_PORT}:8093"
     shm_size: '256m'
@@ -106,14 +118,17 @@ services:
       memlock:
         soft: -1
         hard: -1
+    #environment:
+      # Split Vulkan submissions per graph node on UMA/iGPU to avoid AMDGPU
+      # compute-ring watchdog timeouts that manifest as vk::DeviceLostError.
+      # See: ggml-org/llama.cpp issues #27306, #27076, #26447.
+      #- GGML_VK_MAX_NODES_PER_SUBMIT=1
     command: >
       --models-preset /config/models.ini
       --host 0.0.0.0
       --port 8093
       --models-max ${LLAMA_IGPU_MODELS_MAX}
       -cb
-      -b ${LLAMA_IGPU_BATCH_SIZE}
-      -ub ${LLAMA_IGPU_UBATCH_SIZE}
       --metrics
     restart: unless-stopped
 
@@ -127,6 +142,7 @@ services:
       - PORT=${GPU_EXPORTER_PORT}
     volumes:
       - ${APP_ROOT}/otel/amdgpu_exporter.py:/app/amdgpu_exporter.py:ro
+      - /etc/localtime:/etc/localtime:ro
     command: python3 /app/amdgpu_exporter.py
     restart: unless-stopped
 
@@ -141,6 +157,7 @@ services:
       - LLAMA_SERVERS=${LLAMA_SERVERS}
     volumes:
       - ${APP_ROOT}/otel/llama_sd.py:/app/llama_sd.py:ro
+      - /etc/localtime:/etc/localtime:ro
     command: python3 /app/llama_sd.py
     restart: unless-stopped
     # NOTE: no depends_on on the llama servers — this service must stay
@@ -158,6 +175,8 @@ services:
     hostname: genaivm   # prevent container ID from appearing as host.name in Grafana
     environment:
       - LLAMA_SD_PORT=${LLAMA_SD_PORT}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - GPU_EXPORTER_PORT=${GPU_EXPORTER_PORT}
     group_add:
       - "988"   # docker group — required for docker_stats receiver + resourcedetection
       - "4"     # adm group — required to read /var/log/syslog, auth.log, kern.log
@@ -167,6 +186,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Host logs: classic syslog files
       - /var/log:/var/log/host:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "${OTEL_GRPC_PORT}:4317"   # OTLP gRPC — receive push traces from services on this host
       - "${OTEL_HTTP_PORT}:4318"   # OTLP HTTP
@@ -183,6 +203,7 @@ services:
       - ${GPU_CARD_DEVICE}:${GPU_CARD_DEVICE}
     volumes:
       - ${APP_ROOT}/lact:/etc/lact                          # config.yaml persists here
+      - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped
 
   comfyui-rocm:
@@ -212,6 +233,7 @@ services:
       # Patched built-in scripts — single-file mounts override the image file
       # without shadowing the rest of comfy_extras/
       - ${APP_ROOT}/comfyui/patches/nodes_qwen.py:/ComfyUI/comfy_extras/nodes_qwen.py:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "${COMFYUI_ROCM_PORT}:8188"
     depends_on:
@@ -257,8 +279,32 @@ services:
       - "${VIDEO_GID}"    # video
     volumes:
       - ${GROMACS_PROJECTS_DIR}:/work
+      - /etc/localtime:/etc/localtime:ro
     working_dir: /work
     entrypoint: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # --- Always-on: tasks.md (markdown task board) -----------------------------
+  # No profile: runs in every GPU work mode (switch-mode.sh only stops the
+  # other modes' services, never `down`). Image built locally from the pinned
+  # release tag (tasks.md/Dockerfile, REPO_REF=3.3.0); frontend is prebuilt
+  # into the image, so the container starts in ~1s without network access.
+  # Host port 8090 (8080 is open-webui); container listens on 8080.
+  tasks-md:
+    build:
+      context: ./tasks.md
+      dockerfile: Dockerfile
+    image: tasks-md:latest
+    container_name: tasks-md
+    environment:
+      - PUID=${UID}
+      - PGID=${GID}
+    volumes:
+      - ${APP_ROOT}/tasks.md/tasks:/tasks
+      - ${APP_ROOT}/tasks.md/config:/config
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "${TASKS_MD_PORT}:8080"
     restart: unless-stopped
 
   # --- GPU work-mode: Blender (profile "blender") ---------------------------
@@ -285,6 +331,7 @@ services:
       - HSA_ENABLE_SDMA=0
     volumes:
       - ${APP_ROOT}/blender/work:/work
+      - /etc/localtime:/etc/localtime:ro
     working_dir: /work
     shm_size: '1gb'
     ulimits:

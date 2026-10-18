@@ -1,7 +1,7 @@
 # ComfyUI — ROCm/HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
 # -full variant required: --enable-triton-backend and --fast trigger TorchInductor/
 # Triton JIT kernel compilation at runtime, which needs hipcc from the full ROCm toolchain.
-FROM rocm/dev-ubuntu-24.04:7.14.0-full
+FROM rocm/dev-ubuntu-24.04:7.14.1-full
 
 # Ubuntu 24.04 enforces PEP 668 — pip refuses to install into the system site-packages
 # without this flag. Setting it as an env var applies to all subsequent RUN pip calls.
@@ -20,7 +20,8 @@ RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.lis
 # nightly provides cp312 which matches Ubuntu 24.04's system Python.
 # Pinned to last-known-good dates; bump TORCH_DATE (and torchvision/torchaudio
 # versions below) to upgrade. Versions sourced from the running container.
-ARG TORCH_DATE=20260805
+# torchvision 0.29.0.dev20260808+rocm7.14 requires torch==2.14.0.dev20260807.
+ARG TORCH_DATE=20260807
 RUN pip install --no-cache-dir --pre \
     "torch==2.14.0.dev${TORCH_DATE}+rocm7.14" \
     "torchvision==0.29.0.dev20260808+rocm7.14" \
@@ -29,7 +30,7 @@ RUN pip install --no-cache-dir --pre \
 
 # Clone a pinned release tag — change ARG to upgrade
 # Releases: https://github.com/Comfy-Org/ComfyUI/releases
-ARG COMFYUI_VERSION=v0.28.0
+ARG COMFYUI_VERSION=v0.33.1
 RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
     https://github.com/Comfy-Org/ComfyUI.git /ComfyUI
 

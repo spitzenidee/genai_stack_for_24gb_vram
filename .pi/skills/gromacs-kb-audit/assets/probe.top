@@ -1,0 +1,36 @@
+; Minimal probe: single ALA residue (Protein group) + SPC water (Non-Protein group)
+#include "oplsaa.ff/forcefield.itp"
+#include "oplsaa.ff/spc.itp"
+
+[ moleculetype ]
+PEP 1
+
+[ atoms ]
+1  opls_238  1 ALA N   -0.500
+2  opls_241  1 ALA H    0.300
+3  opls_224B 1 ALA CA   0.140
+4  opls_140  1 ALA HA   0.060
+5  opls_135  1 ALA CB  -0.180
+6  opls_140  1 ALA HB1  0.060
+7  opls_140  1 ALA HB2  0.060
+8  opls_140  1 ALA HB3  0.060
+9  opls_235  1 ALA C    0.500
+10 opls_236  1 ALA O   -0.500
+
+[ bonds ]
+1 2
+1 3
+3 4
+3 5
+3 9
+5 6
+5 7
+5 8
+9 10
+
+[ system ]
+ALA probe in water
+
+[ molecules ]
+PEP 1
+SOL               1533

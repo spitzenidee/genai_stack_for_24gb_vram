@@ -8,7 +8,7 @@
 # stopped) until the next switch.
 #
 # Always-on regardless of mode: lact, gpu-exporter, otel-collector,
-# llama-sd, llamacpp-igpu. The iGPU service runs on the Radeon 780M
+# llama-sd, llamacpp-igpu, tasks-md. The iGPU service runs on the Radeon 780M
 # (independent hardware, own UMA carve-out, no VRAM contention with the
 # eGPU), so it is intentionally NOT listed in MODE_SERVICES below — once
 # started, `restart: unless-stopped` keeps it running across mode switches.
@@ -44,5 +44,5 @@ docker compose --profile "$MODE" up -d ${MODE_SERVICES[$MODE]}
 
 echo
 echo "Switched to ${MODE^^} mode — GPU services: ${MODE_SERVICES[$MODE]}"
-echo "Other modes stopped. Always-on: lact, gpu-exporter, otel-collector, llama-sd, llamacpp-igpu."
+echo "Other modes stopped. Always-on: lact, gpu-exporter, otel-collector, llama-sd, llamacpp-igpu, tasks-md."
 echo "Run 'make status' anytime to check."

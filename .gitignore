@@ -27,6 +27,11 @@ ollama/id_ed25519.pub
 ollama/models/
 
 # =============================================================================
+# General work folder
+# =============================================================================
+work/*
+
+# =============================================================================
 # GROMACS — project/work directory (simulation inputs/outputs, generated data);
 # smoketest.sh / stresstest.sh are source-controlled and intentionally tracked
 # =============================================================================
@@ -61,6 +66,30 @@ blender/work/_stresstest/**/
 blender/work/_stresstest/**/*.blend
 blender/work/_stresstest/**/*.png
 blender/work/_stresstest/**/*.jpg
+
+# =============================================================================
+# tasks.md — runtime data directories (lanes/tasks + CSS/images/sort state);
+# Dockerfile + .dockerignore are source-controlled and intentionally tracked
+# =============================================================================
+tasks.md/tasks/
+tasks.md/config/
+
+# =============================================================================
+# orchestrator — runtime artifacts (decision log, slot state, session logs,
+# flock); orchestrator.py + README.md are source-controlled
+# =============================================================================
+orchestrator/.lock
+orchestrator/logs/
+orchestrator/orchestrator.log
+orchestrator/state.json
+
+# =============================================================================
+# scripts — benchmark results (generated run output)
+# =============================================================================
+scripts/bench-results/
+
+# Python bytecode
+__pycache__/
 
 # =============================================================================
 # Misc

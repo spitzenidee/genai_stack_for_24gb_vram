@@ -1,0 +1,39 @@
+; --- NPT equilibration (Phase 5B) ---
+integrator  = md
+nsteps      = <<<NSTEPS:250000>>>       ; 500 ps at 2 fs (longer for membranes/large)
+dt          = 0.002
+
+; Temperature coupling
+tcoupl      = v-rescale
+tau-t       = 0.1 0.1
+ref-t       = <<<REF_T:300>>> <<<REF_T:300>>>
+tc-grps     = Protein Non-Protein
+
+; Pressure coupling
+pcoupl      = C-rescale    ; correct NPT (2026 recommended); not PR (oscillates if unequilibrated)
+pcoupltype  = isotropic    ; bulk solution. Use 'semiisotropic' for membranes (02.13).
+tau-p       = 2.0          ; ps
+compressibility = 4.5e-5   ; water at 1 atm, 300 K (bar^-1)
+ref-p       = <<<REF_P:1.0>>>          ; bar
+refcoord-scaling = com     ; REQUIRED when using position restraints in NPT (enum: no/com/all — NOT 'yes')
+
+; Neighbor / electrostatics (same as above)
+cutoff-scheme = Verlet
+nstlist     = 10
+rvdw        = 1.0
+rcoulomb    = 1.0
+coulombtype = PME
+pme-order   = 4
+fourierspacing = 0.12
+
+; Constraints
+constraints = h-bonds
+
+; Remove COM motion
+nstcomm     = 1000
+
+; Output
+nstenergy   = 1000
+nstlog      = 1000
+nstxout-compressed = 1000
+; checkpoint interval: mdrun -cpt <minutes> (nstcheckpoint is obsolete in 2026.3)

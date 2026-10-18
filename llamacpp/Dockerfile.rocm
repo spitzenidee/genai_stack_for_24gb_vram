@@ -1,10 +1,18 @@
-# Runtime stage — built on top of the pre-compiled builder image.
-# To update llama.cpp: rebuild Dockerfile.rocm-builder first, then this.
+# Runtime stage — built on top of a pre-compiled builder image.
+# Stock (default, unchanged):        llama-rocm-builder:latest
+# rdna-boosts prototype variant:     --build-arg BUILDER_IMAGE=llama-rocm-builder-rdna:latest
+#   (build + switch docs: Dockerfile.rocm-builder-rdna)
+# To update llama.cpp: rebuild the builder first, then this.
 # To iterate on runtime config only: just rebuild this file (seconds, no recompile).
-FROM llama-rocm-builder:latest
+ARG BUILDER_IMAGE=llama-rocm-builder:latest
+FROM ${BUILDER_IMAGE}
 
 # cmake outputs binary and shared libs both to build/bin/
 # They were installed to /usr/local/bin/ in the builder — point linker there.
-ENV LD_LIBRARY_PATH=/usr/local/lib
+# /opt/rocm/lib is required at runtime for hipblas/rocblas/amdhip64.
+# jemalloc reduces glibc malloc fragmentation from repeated CPU-side allocations
+# during long inference runs (same as comfyui/gromacs/blender).
+ENV LD_LIBRARY_PATH=/usr/local/lib:/opt/rocm/lib \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 ENTRYPOINT ["/usr/local/bin/llama-server"]

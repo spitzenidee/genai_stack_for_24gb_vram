@@ -1,9 +1,9 @@
 # GROMACS — HIP build for gfx1100 (Navi 31 / RX 7900 XTX)
 # -full variant required: building GROMACS itself needs hipcc/amdclang++
 # from the full ROCm toolchain (same reasoning as comfyui/Dockerfile.rocm).
-FROM rocm/dev-ubuntu-24.04:7.14.0-full
+FROM rocm/dev-ubuntu-24.04:7.14.1-full
 
-# The 7.14.0-full base image already exports ROCM_PATH=/opt/rocm at runtime.
+# The 7.14.1-full base image already exports ROCM_PATH=/opt/rocm at runtime.
 # /opt/rocm is a directory whose bin/include/lib entries are symlinks through
 # /etc/alternatives. We keep the explicit assignment as a defensive guard so
 # the cmake flags below resolve correctly even if the base image changes.
@@ -75,8 +75,14 @@ RUN cmake .. \
 # LD_PRELOAD jemalloc — reduces glibc malloc fragmentation from the repeated
 # per-step allocations in neighbor-search/domain-decomposition over long runs
 # (same rationale as llamacpp/Dockerfile.cpu and comfyui/Dockerfile.rocm).
+# LD_LIBRARY_PATH must name /opt/rocm/lib explicitly: the base image does NOT
+# export LD_LIBRARY_PATH in its image config (only PATH + ROCM_PATH), so the
+# ${LD_LIBRARY_PATH} expansion below is empty, and /opt/rocm/lib is also absent
+# from ld.so.conf/ldconfig. Without it every `gmx` invocation dies with
+# "error while loading shared libraries: libamdhip64.so.7" (same pattern as
+# llamacpp/Dockerfile.rocm). /opt/rocm/lib64 is defensive (absent in 7.14.1-full).
 ENV PATH=/usr/local/gromacs/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/gromacs/lib:${LD_LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/usr/local/gromacs/lib:${LD_LIBRARY_PATH} \
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
     HSA_ENABLE_SDMA=0
 

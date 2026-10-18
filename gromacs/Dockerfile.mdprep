@@ -1,0 +1,16 @@
+# md-prep — CPU-only sidecar for GROMACS prep/analysis (v1.0 seed)
+#
+# v1:   python3 + matplotlib — phase-7 plotting (.xvg -> .png) + REPORT.md.
+# v1.1: extend this Dockerfile with ACPYPE + AmberTools (antechamber/sqm)
+#       + PROPKA + PDB2PQR + MDAnalysis (AGENT_SPEC.md §16). Same image name,
+#       no compose entry — always used as a transient container:
+#         docker run --rm -v "$PWD/gromacs/work":/work md-prep:latest <cmd>
+#
+# Deliberately NOT part of the gromacs-rocm GPU image (D5: keep the tuned
+# ROCm build pure). No GPU devices, no stack-mode dependency.
+FROM python:3.12-slim
+
+# matplotlib pulls numpy with it.
+RUN pip install --no-cache-dir matplotlib
+
+WORKDIR /work

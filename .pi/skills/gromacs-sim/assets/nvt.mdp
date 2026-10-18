@@ -1,0 +1,36 @@
+; --- NVT equilibration (Phase 5A) ---
+integrator  = md           ; leap-frog
+nsteps      = <<<NSTEPS:50000>>>        ; 100 ps at 2 fs
+dt          = 0.002        ; 2 fs (h-bonds constraints + SETTLE)
+
+; Temperature coupling
+tcoupl      = v-rescale    ; correct canonical ensemble (2026 recommended)
+tau-t       = 0.1 0.1      ; ps (per group: Protein Non-Protein)
+ref-t       = <<<REF_T:300>>> <<<REF_T:300>>>
+tc-grps     = Protein Non-Protein   ; couple separately (both >10% of atoms)
+
+; No pressure coupling (fixed box)
+pcoupl      = no
+
+; Neighbor / electrostatics (same as em.mdp)
+cutoff-scheme = Verlet
+nstlist     = 10
+rvdw        = 1.0
+rcoulomb    = 1.0
+coulombtype = PME
+pme-order   = 4
+fourierspacing = 0.12
+
+; Constraints
+constraints = h-bonds      ; keep GPU-resident update available (this stack)
+
+; Velocity generation (only for the very first run)
+gen-vel     = yes
+gen-temp    = <<<REF_T:300>>>
+gen-seed    = 42
+
+; Output
+nstenergy   = 1000
+nstlog      = 1000
+nstxout-compressed = 1000
+; checkpoint interval: mdrun -cpt <minutes> (nstcheckpoint is obsolete in 2026.3)

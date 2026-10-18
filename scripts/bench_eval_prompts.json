@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "notes": "Agentic eval set for scripts/bench_egpu_ab.py. Run with temperature=0, seed=42, max_tokens=16384. 'kind': deterministic = exact expected values (hard signal); structural = format/shape assertions (catches corruption and drift). Checks are evaluated in order; a 'json' check stores the extracted value for the json_* checks that follow it.",
+  "check_types": {
+    "json": "extract first|last balanced JSON value from content; expect object|array",
+    "json_keys": "extracted object has all listed keys",
+    "json_array_len": "extracted array has exactly len elements",
+    "json_field_set": "set of obj[field] over array elements == expected set",
+    "json_exact": "extracted object == expected (list values compared sorted)",
+    "json_tool_steps": "obj['steps'] is a 1..max-length array of {tool in allowed, args object, purpose non-empty string}",
+    "json_enum": "obj[field] is one of values",
+    "contains_all": "content contains every listed substring",
+    "fenced_block": "content contains a fenced code block (optional lang)"
+  },
+  "prompts": [
+    {
+      "id": "tool-plan",
+      "kind": "structural",
+      "prompt": "You are a coding agent with access to exactly these tools:\n- read_file(path)\n- grep(pattern, path)\n- edit_file(path, old_text, new_text)\n- run_shell(command)\n\nTask: The repository at /srv/billing has Python files that import the `requests` library. We are migrating to `httpx`. Produce an execution plan that (a) finds all Python files under /srv/billing that contain `import requests`, (b) rewrites each occurrence to `import httpx`, and (c) runs the test suite to verify nothing broke.\n\nConstraints:\n- Use at most 6 steps.\n- Only use the tools listed above.\n- Steps must be in execution order.\n\nRespond with ONLY a JSON object of the form:\n{\"steps\": [{\"tool\": \"<tool name>\", \"args\": {...}, \"purpose\": \"<one line>\"}]}",
+      "checks": [
+        {"type": "json", "which": "first", "expect": "object"},
+        {"type": "json_keys", "keys": ["steps"]},
+        {"type": "json_tool_steps", "allowed": ["read_file", "grep", "edit_file", "run_shell"], "max": 6}
+      ]
+    },
+    {
+      "id": "log-extract",
+      "kind": "deterministic",
+      "prompt": "Below is a log excerpt from a nightly batch job. Extract every line whose level is ERROR.\n\n2026-07-11T02:14:03Z INFO  scheduler: batch job 'etl-nightly' started (run id 8841)\n2026-07-11T02:14:05Z INFO  loader: connected to warehouse replica rw-2\n2026-07-11T02:15:11Z WARN  loader: 12 rows skipped due to null keys in table orders\n2026-07-11T02:16:47Z ERROR loader: timeout after 300s fetching partition dt=2026-07-10 from source-lake\n2026-07-11T02:17:02Z INFO  loader: retry 1/3 for partition dt=2026-07-10\n2026-07-11T02:18:31Z ERROR transformer: schema drift in table payments: column 'fx_rate' missing\n2026-07-11T02:18:32Z WARN  transformer: falling back to last known schema (v41)\n2026-07-11T02:19:58Z INFO  validator: 1,204,551 rows validated, 0 checksum mismatches\n2026-07-11T02:21:14Z ERROR warehouse: insert into analytics.funnel_7d failed: relation \"tmp_funnel_7d_8841\" does not exist\n2026-07-11T02:21:15Z WARN  scheduler: stage 'warehouse-load' marked degraded\n2026-07-11T02:22:40Z INFO  loader: checkpoint written (offset 99120044)\n2026-07-11T02:23:57Z ERROR scheduler: stage 'warehouse-load' exceeded error budget (3/3), aborting run 8841\n2026-07-11T02:23:58Z INFO  scheduler: batch job 'etl-nightly' finished with status FAILED\n\nRespond with ONLY a JSON array containing one object per ERROR line, in log order, of the form:\n[{\"ts\": \"<timestamp>\", \"component\": \"<component>\", \"msg\": \"<message text>\"}]",
+      "checks": [
+        {"type": "json", "which": "first", "expect": "array"},
+        {"type": "json_array_len", "len": 4},
+        {"type": "json_field_set", "field": "ts", "expected": [
+          "2026-07-11T02:16:47Z",
+          "2026-07-11T02:18:31Z",
+          "2026-07-11T02:21:14Z",
+          "2026-07-11T02:23:57Z"
+        ]}
+      ]
+    },
+    {
+      "id": "backup-script",
+      "kind": "structural",
+      "prompt": "Write a single bash script (bash on Ubuntu 24.04) that performs a nightly backup of /data/models with these requirements:\n\n1. Back up the directory /data/models to /backup/models as a single compressed tar.gz archive named models-<YYYYmmdd-HHMMSS>.tar.gz.\n2. Exclude any file matching *.gguf.tmp from the archive.\n3. After creating the archive, delete any archives in /backup/models older than 14 days.\n4. Append a one-line entry per run to /backup/models/backup.log containing the timestamp, the archive name, and its size in bytes.\n5. The script must exit non-zero if the archive creation fails.\n\nRespond with the script in a single fenced ```bash code block and nothing else.",
+      "checks": [
+        {"type": "fenced_block", "lang": "bash"},
+        {"type": "contains_all", "items": ["*.gguf.tmp", "tar", "-mtime +14", "backup.log"]}
+      ]
+    },
+    {
+      "id": "file-state",
+      "kind": "deterministic",
+      "prompt": "Track the following sequence of file-system operations exactly. Start from an empty directory /app.\n\n1. mkdir /app/src\n2. mkdir /app/docs\n3. touch /app/src/main.py\n4. touch /app/src/utils.py\n5. touch /app/docs/readme.md\n6. mkdir /app/src/tests\n7. touch /app/src/tests/test_main.py\n8. mv /app/docs/readme.md /app/docs/README.md\n9. rm /app/src/utils.py\n10. touch /app/src/config.yaml\n11. mv /app/src/tests/test_main.py /app/src/tests/test_app.py\n12. touch /app/notes.txt\n\nAfter all 12 operations, respond with ONLY a JSON object mapping each existing directory (relative to /app, using \".\" for /app itself) to the sorted list of file names directly inside it. Include only directories that exist, and only files (not subdirectories). Example shape:\n{\".\": [\"notes.txt\"], \"src\": [\"main.py\"]}",
+      "checks": [
+        {"type": "json", "which": "last", "expect": "object"},
+        {"type": "json_exact", "expected": {
+          ".": ["notes.txt"],
+          "src": ["config.yaml", "main.py"],
+          "src/tests": ["test_app.py"],
+          "docs": ["README.md"]
+        }}
+      ]
+    },
+    {
+      "id": "ci-debug",
+      "kind": "structural",
+      "prompt": "A CI job for a Python service failed. Below is the tail of the log:\n\n$ pytest -x tests/\ntests/test_api.py::test_health PASSED\ntests/test_api.py::test_create_item PASSED\ntests/test_api.py::test_create_item_validation FAILED\ntests/test_api.py::test_list_items\n=================================== FAILURES ===================================\n_______________ test_create_item_validation _______________\n    def test_create_item_validation():\n        resp = client.post(\"/items\", json={\"price\": -5})\n>       assert resp.status_code == 422\nE       AssertionError: assert 201 == 422\n\ntests/test_api.py:41: AssertionError\n----------------------------- Captured log -----------------------------\nWARNING  app.validation:validation.py:87 negative price accepted: validator 'price_gte_zero' not registered\n=========================== short test summary info ============================\nFAILED tests/test_api.py::test_create_item_validation - AssertionError: asse...\n!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!\n\nContext: the validation registry is built in app/validation.py by calling register() for each rule; the rule list VALIDATOR_NAMES lives in app/config.py. A recent commit refactored app/config.py to import VALIDATOR_NAMES from a new settings module, but the job that generates that module only runs in the release pipeline.\n\nReason step by step about the most likely root cause, then respond with a FINAL line containing ONLY a JSON object:\n{\"root_cause\": \"<one sentence>\", \"fix\": \"<one sentence>\", \"confidence\": \"<high|medium|low>\"}",
+      "checks": [
+        {"type": "json", "which": "last", "expect": "object"},
+        {"type": "json_keys", "keys": ["root_cause", "fix", "confidence"]},
+        {"type": "json_enum", "field": "confidence", "values": ["high", "medium", "low"]}
+      ]
+    },
+    {
+      "id": "phase-switch",
+      "kind": "structural",
+      "prompt": "You are working through a design task in alternating phases. This exercise deliberately switches between code generation and reasoning; follow the phases in order and label each phase's output with its exact header.\n\nPHASE 1 — CODE (header: \"## PHASE 1: CODE\")\nImplement a Python class `TokenBucket` in a single fenced ```python block:\n- __init__(self, rate: float, capacity: int): rate = tokens added per second, capacity = maximum tokens.\n- consume(self, n: int = 1) -> bool: refill by elapsed time since the last call (time.monotonic()), then return True and remove n tokens if enough are available, else False.\n- No external dependencies.\n\nPHASE 2 — REASON (header: \"## PHASE 2: REASON\")\nReason step by step about your implementation: (a) state its worst-case time and memory complexity per consume() call, and (b) identify one edge case where the current logic gives a wrong answer (think about capacity clamping, very large elapsed gaps, or n > capacity).\n\nPHASE 3 — CODE (header: \"## PHASE 3: CODE\")\nIn a single fenced ```python block, show the corrected TokenBucket class that handles the edge case you named.\n\nPHASE 4 — REASON (header: \"## PHASE 4: REASON\")\nIn 2-4 sentences, explain what trade-off or behavioral change the fix introduces.\n\nPHASE 5 — CODE (header: \"## PHASE 5: CODE\")\nIn a single fenced ```python block, show the final TokenBucket class.\n\nAfter the five phases, end with a FINAL line containing ONLY a JSON object:\n{\"complexity_time\": \"<big-O per consume()>\", \"complexity_memory\": \"<big-O>\", \"edge_case\": \"<one short phrase>\"}",
+      "checks": [
+        {"type": "contains_all", "items": ["## PHASE 1: CODE", "## PHASE 2: REASON", "## PHASE 3: CODE", "## PHASE 4: REASON", "## PHASE 5: CODE"]},
+        {"type": "fenced_block", "lang": "python"},
+        {"type": "json", "which": "last", "expect": "object"},
+        {"type": "json_keys", "keys": ["complexity_time", "complexity_memory", "edge_case"]}
+      ]
+    }
+  ]
+}

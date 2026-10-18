@@ -1,0 +1,18 @@
+# Vendored upstream pin (reproducible + offline build).
+#
+# tool:      depsafe — Dependency Typosquatting & Slopsquatting Checker
+# repo:      https://github.com/kriskimmerle/depsafe
+# version:   0.1.0
+# commit:    067b09d4424549cb14fe2e998998649f29d4ca4c (2026-02-03)
+# license:   MIT (see depsafe-LICENSE)
+# file:      depsafe.py (single zero-dependency file, requires-python >= 3.9)
+#
+# Local patch (applied on top of the pinned commit, see the "Local patch"
+# comment in depsafe.py query_pypi): PyPI returns naive upload_time values
+# for old releases, which crashed `--online` with a naive/aware datetime
+# TypeError. The patch normalizes naive datetimes to UTC. No other changes.
+#
+# To bump: download the new depsafe.py from the repo at the pinned commit,
+# replace depsafe.py + depsafe-LICENSE, re-apply the local patch if the
+# query_pypi code is unchanged, update this file, rebuild the image
+# (vuln-scan.sh build), and note the new pin in the board card Log.

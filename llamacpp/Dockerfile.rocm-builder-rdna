@@ -1,0 +1,169 @@
+# Produces llama-rocm-builder-rdna:latest — llama.cpp at the rdna-boosts fork
+# point with the 12-block rdna-boosts patch set applied (RDNA performance work
+# for gfx1100 / RX 7900 XTX: MTP decode, BF16 KV + WMMA flash-attn, fused MoE
+# and k-quant decode paths, attention-memory campaign).
+#
+# PROTOTYPE VARIANT — parallel to Dockerfile.rocm-builder (stock/vanilla),
+# which stays untouched. The two builders are independent image lines.
+#
+# Patch source: https://github.com/stew675/llama-cpp-rdna-boosts
+# Pinned to a FROZEN TAG (RDNA_RELEASE below), not main. The tag tarball
+# carries its own release.json manifest (base SHA, canonical applied tree
+# hash, per-patch sha256), which is verified in the fetch stage. Bumping the
+# pin = change RDNA_RELEASE + rebuild both images.
+#
+# ── Build / rebuild (from the genai_stack repo root) ─────────────────────
+#   docker build -f llamacpp/Dockerfile.rocm-builder-rdna \
+#        -t llama-rocm-builder-rdna:latest llamacpp/
+#   docker build -f llamacpp/Dockerfile.rocm \
+#        --build-arg BUILDER_IMAGE=llama-rocm-builder-rdna:latest \
+#        -t llama-cpp-rocm:rdna llamacpp/
+#
+# ── Switch (edit .env in the repo root, then) ────────────────────────────
+#   LLAMA_EGPU_IMAGE=llama-cpp-rocm:rdna      # this (patched) variant
+#   LLAMA_EGPU_IMAGE=llama-cpp-rocm:latest    # stock vanilla variant
+#   # Re-point the preset symlink to MATCH the image (before the up -d):
+#   cd llamacpp && ln -sfn models-egpu-rdna.ini    models-egpu.ini   # rdna
+#   cd llamacpp && ln -sfn models-egpu-vanilla.ini models-egpu.ini   # vanilla
+#   docker compose up -d llamacpp-egpu
+# WHY the symlink: the compose service mounts llamacpp/models-egpu.ini, which
+# is a symlink (docker follows it at container creation). It points to
+# models-egpu-vanilla.ini (11 models, vanilla-safe) by default, or to
+# models-egpu-rdna.ini (12 models), which adds the draft-mtp-adaptive entry
+# whose keys (spec-type=draft-mtp-adaptive, spec-draft-n-min-adaptive) exist
+# ONLY in this patched binary — the stock upstream binary aborts on them
+# (upstream PR #27210 is unmerged), so the vanilla image crash-loops if it
+# sees that entry. scripts/bench_egpu_ab.py re-points the symlink
+# automatically during its image switches.
+#
+# ── Rebuild only when ────────────────────────────────────────────────────
+#   * you bump RDNA_RELEASE to a new rdna-boosts tag, or
+#   * the ROCm base image changes.
+# The thin runtime stage (Dockerfile.rocm) then rebuilds in seconds.
+#
+# ── Tuning candidates (A/B during benchmarking, one variable at a time) ──
+# The repo's docs (ENVIRONMENT.md) require NO env vars or start-parameter
+# changes — the patched binary is designed to run on the same parameters as
+# vanilla (confirmed: server serves fine on our current config). Two
+# documented candidates in models-egpu.ini, to test when we benchmark:
+#   1. spec-type = draft-mtp → draft-mtp-adaptive  (per Qwen model)
+#      Block 01 IS the adaptive-MTP-draft-depth controller and plain
+#      draft-mtp does not use it (ENVIRONMENT.md §3). Constraints: cannot
+#      combine draft-mtp + draft-mtp-adaptive (rejected); in adaptive mode
+#      spec-draft-n-min is unused (warns) — use spec-draft-n-min-adaptive.
+#   2. ubatch-size = 2048 → 4096  (global)
+#      Repo's validated sweet spot is -ub 4096; the slab allocator (default
+#      on) + LLAMA_DROP_COMPUTE_BUFFERS (default on, "a server may drop too"
+#      since r22) removed the old wide-prefill/arena conflict that 2048 was
+#      sized around. Caveat: their numbers are MoE-offload configs on 32 GB
+#      cards, not our dense 27B + 180k KV — experiment, not a documented win.
+
+# Frozen delivery tag. r72 = 2026-10-16: the V2.0 re-org (r51) re-cuts the
+# patch set 16 → 12 blocks (behaviour-preserving per the fork's same-seed
+# gates) on upstream base 097cf33d9 (2026-10-12, +195 commits vs r37's
+# a55e952b8). For our dense Qwen3.8-27B Q4_K_M 1-GPU MTP stack (RX 7900 XTX,
+# gfx1100): gfx1100 Q4_K VDR-4 dense mmvq dot (r69 #162, +2.1 % decode
+# measured on our exact hardware), RDNA3 mmvq vecdot ALU reduction
+# (r65 #159, +0.8 %), draft-sched2 MTP graph reuse (r65 #154), Q4_K verify
+# batch (r65 #156), MMB tile fix (r65 #155), grid-stall pad (r45 #128),
+# FA prefill staging arena prealloc (r53 #138), opt-in async graph inputs
+# (r68: GGML_CUDA_ASYNC_INPUT=1). Our draft-mtp-adaptive controller is kept
+# (block 02). Full analysis + A/B plan: board card "Spec - analyze rdna
+# llama patch GitHub repo for new releases" (16.10.2026).
+# Note: r38-r48 exist as tags without published GitHub Release objects; the
+# tag tarball is the frozen, self-verifying delivery point (release.json inside).
+
+FROM rocm/dev-ubuntu-24.04:7.14.1-full
+
+# (Re-declared inside the stage: an ARG before FROM only parameterizes the
+# base image line and does not carry into RUN instructions.)
+ARG RDNA_RELEASE=v12-097cf33d9-r72
+
+# Defensive guard consistent with gromacs/blender; base image already exports it.
+ENV ROCM_PATH=/opt/rocm
+
+# Same toolchain as Dockerfile.rocm-builder (stock) + jq for the release
+# manifest. ROCm 7.14.1 is the toolchain the rdna-boosts claims are measured on.
+RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    jq \
+    pkg-config \
+    libcurl4-openssl-dev \
+    libgomp1 \
+    libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Fetch + verify the pinned patch delivery, apply to the fork point ────
+# 1. Tag tarball of the delivery repo (frozen; contains patches/, release.json).
+# 2. Verify every patch file's sha256 against the embedded release.json manifest.
+# 3. Fetch upstream llama.cpp at release.json.base (codeload tarball by SHA —
+#    no full history), git init + `git add -A -f` (the -f keeps upstream-tracked
+#    files that match .gitignore, so the base tree is canonical — same as the
+#    delivery's own CI), one base commit.
+# 4. Strict `git am` of the 12 blocks (NO -3 fallback: any drift fails the
+#    build loudly instead of silently merging hunks).
+# 5. Assert the applied tree hash equals release.json.tree — catches a stale
+#    fork point or a mismatched patch set before anything gets compiled.
+RUN set -eux; \
+    curl -fsSL -o /tmp/rdna.tar.gz \
+        "https://github.com/stew675/llama-cpp-rdna-boosts/tarball/${RDNA_RELEASE}"; \
+    mkdir -p /tmp/rdna; \
+    tar -xzf /tmp/rdna.tar.gz -C /tmp/rdna; \
+    RDNA_DIR="$(find /tmp/rdna -maxdepth 1 -mindepth 1 -type d)"; \
+    test -f "$RDNA_DIR/release.json"; \
+    case "$(basename "$RDNA_DIR")" in \
+        stew675-llama-cpp-rdna-boosts-*) ;; \
+        *) echo "ERROR: unexpected tarball layout: $RDNA_DIR"; exit 1 ;; \
+    esac; \
+    jq -r '.release' "$RDNA_DIR/release.json"; \
+    jq -r '.patches | to_entries[] | "\(.value)  patches/\(.key)"' "$RDNA_DIR/release.json" \
+        | (cd "$RDNA_DIR" && sha256sum -c -); \
+    BASE="$(jq -r '.base' "$RDNA_DIR/release.json")"; \
+    curl -fsSL -o /tmp/llama.tar.gz "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${BASE}"; \
+    tar -xzf /tmp/llama.tar.gz -C /app --strip-components=1; \
+    cd /app; \
+    git init -q; \
+    git config user.email "build@local"; \
+    git config user.name "docker-build"; \
+    git add -A -f; \
+    git commit -q -m "llama.cpp ${BASE} (base)"; \
+    git am "$RDNA_DIR"/patches/[0-9][0-9][0-9][0-9]-*.patch; \
+    TREE="$(jq -r '.tree' "$RDNA_DIR/release.json")"; \
+    APPLIED="$(git rev-parse 'HEAD^{tree}')"; \
+    if [ "$APPLIED" != "$TREE" ]; then \
+        echo "ERROR: applied tree $APPLIED != release.json tree $TREE"; \
+        echo "ERROR: fork point and/or patch set do not match the recorded delivery"; \
+        exit 1; \
+    fi; \
+    echo "rdna-boosts ${RDNA_RELEASE} applied: tree $APPLIED verified against manifest"; \
+    git log --oneline -17; \
+    rm -rf /tmp/rdna /tmp/rdna.tar.gz /tmp/llama.tar.gz
+
+# ── Build with HIP backend targeting gfx1100 (Navi 31 / RX 7900 XTX) ─────
+# Stock flags from Dockerfile.rocm-builder, plus:
+#   GGML_HIP_RCCL=ON  — required by block 12's hybrid all-reduce; on gfx1100
+#                       the internal AR is gated off and traffic falls back to
+#                       RCCL (librccl ships in the -full base image).
+# AMDGPU_TARGETS=gfx1100 only — single-eGPU host; the delivery's CI builds
+# five RDNA archs (gfx1100/1150/1151/1200/1201), we don't pay for the rest.
+# GGML_NATIVE=OFF: binary must run inside container, not tuned to host CPU
+# (same rationale as the stock builder).
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+    cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=ON \
+    -DAMDGPU_TARGETS=gfx1100 \
+    -DGGML_NATIVE=OFF \
+    -DGGML_OPENMP=ON \
+    -DGGML_HIP_MMQ_MFMA=ON \
+    -DGGML_HIP_GRAPHS=ON \
+    -DGGML_HIP_RCCL=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build build --config Release -j $(nproc) && \
+    cmake --install build

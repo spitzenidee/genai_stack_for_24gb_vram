@@ -9,7 +9,7 @@ compare to published reference numbers.
 ## Build gotchas (already fixed in Dockerfile.rocm, kept here for reference)
 
 1. **`ROCM_PATH` is exported by the base image, but we keep it explicit.**
-   `rocm/dev-ubuntu-24.04:7.14.0-full` already sets `ROCM_PATH=/opt/rocm`
+   `rocm/dev-ubuntu-24.04:7.14.1-full` already sets `ROCM_PATH=/opt/rocm`
    (`/opt/rocm` is a directory with `bin`, `include`, `lib`, etc. symlinks
    through `/etc/alternatives`). The explicit `ENV ROCM_PATH=/opt/rocm` in
    the Dockerfile is a defensive guard so compiler paths don't silently

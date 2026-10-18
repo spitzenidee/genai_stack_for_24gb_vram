@@ -1,0 +1,17 @@
+{
+  "canonical": {},
+  "internal": {},
+  "allowed": {},
+  "similarity_exceptions": {},
+  "metadata_exceptions": {},
+  "min_version_age_hours": 72,
+  "allow_unresolved_versions": false,
+  "allow_legacy_npm_v1_lockfile": false,
+  "trusted_local_paths": {},
+  "trusted_registries": {},
+  "trusted_git_sources": {},
+  "trusted_indexes": {},
+  "cargo_git_policy": "block",
+  "python_enforcement": "prefer_poetry",
+  "poetry_lock_policy": "warn_missing_proofs"
+}
