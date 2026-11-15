@@ -1,5 +1,5 @@
 # Produces llama-rocm-builder-rdna:latest — llama.cpp at the rdna-boosts fork
-# point with the 12-block rdna-boosts patch set applied (RDNA performance work
+# point with the 16-block rdna-boosts patch set applied (RDNA performance work
 # for gfx1100 / RX 7900 XTX: MTP decode, BF16 KV + WMMA flash-attn, fused MoE
 # and k-quant decode paths, attention-memory campaign).
 #
@@ -58,26 +58,30 @@
 #      sized around. Caveat: their numbers are MoE-offload configs on 32 GB
 #      cards, not our dense 27B + 180k KV — experiment, not a documented win.
 
-# Frozen delivery tag. r72 = 2026-10-16: the V2.0 re-org (r51) re-cuts the
-# patch set 16 → 12 blocks (behaviour-preserving per the fork's same-seed
-# gates) on upstream base 097cf33d9 (2026-10-12, +195 commits vs r37's
-# a55e952b8). For our dense Qwen3.8-27B Q4_K_M 1-GPU MTP stack (RX 7900 XTX,
-# gfx1100): gfx1100 Q4_K VDR-4 dense mmvq dot (r69 #162, +2.1 % decode
-# measured on our exact hardware), RDNA3 mmvq vecdot ALU reduction
-# (r65 #159, +0.8 %), draft-sched2 MTP graph reuse (r65 #154), Q4_K verify
-# batch (r65 #156), MMB tile fix (r65 #155), grid-stall pad (r45 #128),
-# FA prefill staging arena prealloc (r53 #138), opt-in async graph inputs
-# (r68: GGML_CUDA_ASYNC_INPUT=1). Our draft-mtp-adaptive controller is kept
-# (block 02). Full analysis + A/B plan: board card "Spec - analyze rdna
-# llama patch GitHub repo for new releases" (16.10.2026).
-# Note: r38-r48 exist as tags without published GitHub Release objects; the
-# tag tarball is the frozen, self-verifying delivery point (release.json inside).
+# Frozen delivery tag. r205 = 2026-11-02: the v16 series on upstream base
+# 6050b467c — the SAME base as the prior r176 pin (v15→v16 is the rdna
+# patch-series counter, not an upstream change), 16 blocks (adds block 15
+# "streamed KV" — a fixed VRAM reduction, ~+2.8 GiB headroom on our config).
+# Decode-side wins for our dense Qwen3.8-27B Q4_K_M 1-GPU MTP-adaptive stack
+# (RX 7900 XTX, gfx1100): r187 q8_0-KV decode rotations (+10–13% decode),
+# r183 GDN folds (+1.7–5.9%), r184 ngram-mod (+1.6–2.1%), r195 GDN
+# correctness fix, r193 streamed-KV VRAM headroom; below r187 the r176-era
+# wins (fake MoE-cache band removal, RDNA3 decode fusions, graph-replay /
+# MTP-verify) carry over unchanged. (Prior pin r176 = 15 blocks, same base;
+# before that r110 = 14 blocks on base 097cf33d9; r72 = the V2.0 re-org that
+# re-cut the patch set 16 → 12 blocks.) Full analysis + A/B plan: board card
+# "Spec - assess llama.cpp and RDNA patch repos for worthwhile releases"
+# (30.10.2026).
+# Note: r38-r48 and the v16-* series exist as tags without published GitHub
+# Release objects (the v16-* have LOWER release counters r1–r50 — a trap);
+# newest = highest release counter among published Release objects. The tag
+# tarball is the frozen, self-verifying delivery point (release.json inside).
 
 FROM rocm/dev-ubuntu-24.04:7.14.1-full
 
 # (Re-declared inside the stage: an ARG before FROM only parameterizes the
 # base image line and does not carry into RUN instructions.)
-ARG RDNA_RELEASE=v12-097cf33d9-r72
+ARG RDNA_RELEASE=v16-6050b467c-r205
 
 # Defensive guard consistent with gromacs/blender; base image already exports it.
 ENV ROCM_PATH=/opt/rocm
@@ -106,7 +110,7 @@ WORKDIR /app
 #    no full history), git init + `git add -A -f` (the -f keeps upstream-tracked
 #    files that match .gitignore, so the base tree is canonical — same as the
 #    delivery's own CI), one base commit.
-# 4. Strict `git am` of the 12 blocks (NO -3 fallback: any drift fails the
+# 4. Strict `git am` of the 16 blocks (NO -3 fallback: any drift fails the
 #    build loudly instead of silently merging hunks).
 # 5. Assert the applied tree hash equals release.json.tree — catches a stale
 #    fork point or a mismatched patch set before anything gets compiled.

@@ -3,20 +3,21 @@
 bench_egpu_ab.py — A/B benchmark for the llamacpp-egpu server (RX 7900 XTX eGPU).
 
 Compares, on the SAME model and the SAME prompts:
-  1. vanilla             llama-cpp-rocm:latest   egpu-SWIFT-1.5-Qwen3.8-27B-Q4KM_KVQ4
-  2. rdna-adaptive       llama-cpp-rocm:rdna     egpu-SWIFT-1.5-Qwen3.8-27B-Q4KM_KVQ4-adaptive
+  1. rdna-r176           llama-cpp-rocm:rdna-r176 egpu-SWIFT-1.5
+  2. rdna-r205           llama-cpp-rocm:rdna      egpu-SWIFT-1.5
 
-This is the PRODUCTION set (chosen 2026-10-10 after the r37 A/B sweep, see the
-comment block on the -adaptive entry in llamacpp/models-egpu-rdna.ini):
-vanilla is the stock-baseline anchor, rdna-adaptive is the production llm
-config. The r37 sweep's other variants (plain d3, nmax9, p6, p9, d2, d1,
-pmin07, ngram-off) were dropped — five measured worse, three competitive but
-fixed-depth (no adaptivity). Re-add them (or new ones) only when a new
-rdna-boosts release hints at new configs to test.
+This is the 2-way rebuild set (04.11.2026, card "Implement - rebuild eGPU
+rdna r176 to r205 + iGPU v0.8.0 + 2-way A-B bench handover"): rdna-r176 is
+the previous production rdna-boosts release (v15-6050b467c-r176, kept as a
+throwaway image for the bench) and rdna-r205 is the current production config
+on the rebuilt r205 image (v16-6050b467c-r205, same upstream base 6050b467c).
+The r176→r205 delta (Deltas row + Within-rdna matrix in summary.md) answers
+"does the rebuild win?". The vanilla anchor was already established as losing
+to rdna (30.10.2026 3-way bench), so it is not part of this set.
 
 The script switches images itself (rewrites LLAMA_EGPU_IMAGE in .env,
 `docker compose up -d llamacpp-egpu`, waits for health) and restores .env on
-exit (finally). Configs 2-6 share the rdna image, so a full run performs
+exit (finally). The 2-way set uses 2 distinct images, so a full run performs
 exactly 2 container recreations.
 
 Measurements per config:
@@ -28,6 +29,16 @@ Measurements per config:
   * evaluation: agentic prompt set from bench_eval_prompts.json at
     temperature=0, seed=42; assertion-based scoring + corruption scan
     (//// marker, repeated-token loops).
+  * vram (optional, --vram): headroom step — baseline sample of the eGPU's
+    sysfs VRAM counter after warmup, then fill prompts sized to the ladder
+    (default 100% = n_ctx − reserve) while a 10 Hz daemon poller records the
+    live peak. The KV is pre-allocated for n_ctx, so the 100% fill is the
+    steady-state peak and the ladder (25/50/75/100%) confirms the flat shape
+    (a rising curve would flag a future non-unified KV config). Records
+    baseline / per-level peak / headroom / per-request usage.prompt_tokens
+    (authoritative cross-check — per-request, so it stays valid even when
+    other traffic shares the server) + n_tokens_max (secondary high-water
+    mark) + the latest 'MiB free on ROCm0' server-log line.
 
 Optional OMP self-diagnostic pass (see --omp-passive): re-runs the throughput
 reps of ONE config with OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0 in the
@@ -50,6 +61,8 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -66,6 +79,17 @@ SERVICE = "llamacpp-egpu"
 BASE_URL = "http://localhost:8092"
 ENV_KEY = "LLAMA_EGPU_IMAGE"
 
+# VRAM headroom step (--vram): the live source is the eGPU's sysfs counter
+# (card1 = RX 7900 XTX, 24 GB) — the exact read gpu_monitor.sh uses. The
+# llama.cpp API has no memory surface in the current builds (v0.8.0 / r205
+# base 6050b467c; PR #26130 unmerged), so the bench polls the file from a
+# daemon thread. The eGPU is headless and dedicated to llama, so
+# mem_info_vram_used ≈ the llama-server footprint (no display/compositor).
+VRAM_SYSFS_USED = Path("/sys/class/drm/card1/device/mem_info_vram_used")
+VRAM_SYSFS_TOTAL = Path("/sys/class/drm/card1/device/mem_info_vram_total")
+VRAM_POLL_HZ = 10.0
+GIB = 1024 ** 3
+
 # The compose service mounts models-egpu.ini, which is a symlink (docker
 # follows it at container creation). The vanilla image's stock binary cannot
 # parse the draft-mtp-adaptive preset entry (upstream PR #27210 unmerged —
@@ -79,7 +103,14 @@ INI_RDNA = REPO_ROOT / "llamacpp" / "models-egpu-rdna.ini"
 
 
 def ini_for_image(image: str) -> Path:
-    return INI_RDNA if image == "llama-cpp-rocm:rdna" else INI_VANILLA
+    # Any rdna-boosts build (rdna, rdna-r110, rdna-r176, ...) needs the rdna
+    # preset: its draft-mtp-adaptive spec-type is only parseable by the
+    # rdna-boosts binary, not the stock vanilla binary. Match the whole rdna
+    # family, not just the exact production tag — a kept/retagged rdna image
+    # (e.g. rdna-r110) must get the rdna preset too, or its model
+    # (egpu-SWIFT-1.5) is absent from the vanilla preset and the config is
+    # silently skipped (30.10.2026 rebuild bench: the rdna-r110 leg was lost).
+    return INI_RDNA if image.startswith("llama-cpp-rocm:rdna") else INI_VANILLA
 
 
 def set_active_ini(image: str) -> None:
@@ -98,9 +129,15 @@ def active_ini_target() -> str | None:
         return ACTIVE_INI.resolve().name
     return None
 
+# 2-way rebuild benchmark (04.11.2026): the kept r176 image vs the freshly
+# rebuilt r205 rdna image. Same Swift 1.5 27B model (egpu-SWIFT-1.5), same
+# rdna preset, no model-ID changes. rdna-r176 is the tagged pre-rebuild image
+# (a persistent tag, not rebuilt by this script); rdna is the new r205 image.
+# Both are rdna-family -> the rdna preset. See board card "Implement - rebuild
+# eGPU rdna r176 to r205 + iGPU v0.8.0 + 2-way A-B bench handover".
 CONFIGS = [
-    {"name": "vanilla",       "image": "llama-cpp-rocm:latest", "model": "egpu-SWIFT-1.5-Qwen3.8-27B-Q4KM_KVQ4"},
-    {"name": "rdna-adaptive", "image": "llama-cpp-rocm:rdna",   "model": "egpu-SWIFT-1.5-Qwen3.8-27B-Q4KM_KVQ4-adaptive"},
+    {"name": "rdna-r176", "image": "llama-cpp-rocm:rdna-r176", "model": "egpu-SWIFT-1.5"},
+    {"name": "rdna-r205", "image": "llama-cpp-rocm:rdna",      "model": "egpu-SWIFT-1.5"},
 ]
 
 IMAGE_REBUILD_CMDS = {
@@ -346,6 +383,49 @@ def now_iso() -> str:
 def http_get_json(url: str, timeout: float = 10.0):
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def http_get_raw(url: str, timeout: float = 10.0) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode()
+
+
+def http_post_json(url: str, body: dict, timeout: float = 60.0):
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def tokenize(model: str, text: str, timeout: float = 120.0) -> list:
+    """Exact token count of `text` via the server's /tokenize endpoint.
+    Router mode: the model goes in the JSON body (not a query param)."""
+    return http_post_json(BASE_URL + "/tokenize",
+                          {"model": model, "content": text},
+                          timeout=timeout).get("tokens", [])
+
+
+def parse_n_tokens_max(metrics_text: str) -> int | None:
+    """llamacpp:n_tokens_max = largest observed sequence length (high-water
+    mark — not reset between requests, so the ladder runs ascending and each
+    level's reading ≈ its own prompt length)."""
+    m = re.search(r"^llamacpp:n_tokens_max\s+([0-9.]+)\s*$", metrics_text, re.M)
+    return int(float(m.group(1))) if m else None
+
+
+def get_n_tokens_max(model: str, timeout: float = 30.0) -> int | None:
+    # 30 s (raised from 15 s): this is fetched right after a large prefill,
+    # when the server can be briefly busy; a timeout here would drop the
+    # secondary cross-check for that level. The authoritative cross-check is
+    # the per-request usage.prompt_tokens, so a missed metrics read is a
+    # degraded — not invalid — measurement.
+    try:
+        return parse_n_tokens_max(
+            http_get_raw(BASE_URL + f"/metrics?model={model}", timeout))
+    except Exception:
+        return None
 
 
 def stream_chat(model: str, prompt: str, max_tokens: int,
@@ -682,15 +762,32 @@ def run_warmup(model: str) -> None:
         f"({len(r['content']) + len(r['reasoning'])} chars back)")
 
 
+def _fmt_num(x, spec: str = ".1f") -> str:
+    """Format a float for a log line, or 'n/a' when the server gave no value."""
+    return format(x, spec) if x is not None else "n/a"
+
+
 def run_throughput(model: str, args, out_path: Path) -> dict:
     data = {"reps": []}
     for i in range(args.reps):
         prompt = build_throughput_prompt(i % len(VARIANTS))
         log(f"throughput rep {i + 1}/{args.reps}: prompt {len(prompt)} chars, "
             f"generating up to {args.gen_tokens} tokens...")
-        t0 = time.monotonic()
-        r = stream_chat(model, prompt, max_tokens=args.gen_tokens, timeout=args.request_timeout)
-        wall = time.monotonic() - t0
+        # An empty response (no content, no usage, no timings) means the server
+        # aborted the request (transient). Retry it — a single bad rep must not
+        # crash the run (see 23.10.2026 spec-variants run: config 3 rep 1
+        # returned an empty stream and the unguarded log line killed the run).
+        r, wall = None, 0.0
+        for attempt in range(1, 4):
+            t0 = time.monotonic()
+            r = stream_chat(model, prompt, max_tokens=args.gen_tokens,
+                            timeout=args.request_timeout)
+            wall = time.monotonic() - t0
+            if r["content"] or r["usage"] or r["timings"]:
+                break
+            log(f"  WARNING rep {i + 1} attempt {attempt}/3: server returned an "
+                f"empty stream in {wall:.1f}s (no content/usage/timings) — retrying")
+            time.sleep(5)
         usage, timings = r["usage"] or {}, r["timings"] or {}
         rep = {
             "rep": i + 1,
@@ -712,8 +809,9 @@ def run_throughput(model: str, args, out_path: Path) -> dict:
                 f"KV prefix-cache hit; prefill number for this rep is suspect")
         data["reps"].append(rep)
         save_json(out_path, data)  # incremental: a crash never loses finished reps
-        log(f"  rep {i + 1}: prefill {rep['prompt_tps']:.1f} t/s, decode {rep['decode_tps']:.1f} t/s, "
-            f"TTFT {rep['ttft_s']:.2f}s, wall {wall:.0f}s, "
+        log(f"  rep {i + 1}: prefill {_fmt_num(rep['prompt_tps'])} t/s, "
+            f"decode {_fmt_num(rep['decode_tps'])} t/s, "
+            f"TTFT {_fmt_num(rep['ttft_s'], '.2f')}s, wall {wall:.0f}s, "
             f"draft {rep['draft_n_accepted']}/{rep['draft_n']}, finish={rep['finish_reason']}")
     return data
 
@@ -753,11 +851,351 @@ def run_eval(model: str, eval_specs: dict, args, out_path: Path) -> list:
     return results
 
 
+# ── VRAM headroom step (--vram) ───────────────────────────────────────────────
+# Measurement model (verified live 04.11.2026, card "Spec - A-B bench VRAM
+# headroom step"): the KV cache is pre-allocated for n_ctx, so VRAM rises from
+# fresh load to a steady-state (compute/activation overhead initializing) and
+# stays FLAT as the prompt grows toward n_ctx. The 100% fill (n_ctx − reserve)
+# IS the peak; the ladder (25/50/75/100%) is a confirmation of the flat shape
+# (a rising curve would flag a future non-unified KV config). The wall (OOM)
+# is at n_ctx — beyond it the server rejects (400); KV shifting is disabled,
+# so there is no server-side compaction/eviction to trigger.
+
+def read_vram_bytes(path: Path = VRAM_SYSFS_USED) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_vram_total_gib(path: Path = VRAM_SYSFS_TOTAL) -> float | None:
+    b = read_vram_bytes(path)
+    return b / GIB if b is not None else None
+
+
+class VramPoller:
+    """Daemon-thread poller for the eGPU sysfs VRAM counter.
+
+    Collects (t_rel_s, bytes) samples at a fixed rate while a fill request
+    runs. Daemon thread: a Ctrl-C never leaves it behind. `read_fn` is
+    injectable so the selftest can exercise the machinery offline."""
+
+    def __init__(self, read_fn, hz: float = VRAM_POLL_HZ):
+        self._read = read_fn
+        self._hz = hz
+        self.samples: list[tuple[float, int]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.samples = []
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        interval = 1.0 / self._hz
+        t0 = time.monotonic()
+        i = 0
+        while not self._stop.is_set():
+            b = self._read()
+            if b is not None:
+                self.samples.append((round(time.monotonic() - t0, 3), b))
+            i += 1
+            delay = t0 + i * interval - time.monotonic()
+            if delay > 0:
+                self._stop.wait(delay)
+
+    def stop(self, timeout: float = 5.0) -> list[tuple[float, int]]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+        return self.samples
+
+
+def sample_vram_baseline(read_fn, hz: float = VRAM_POLL_HZ,
+                         duration_s: float = 2.0) -> dict:
+    """~2 s of baseline samples (20 @ 100 ms) — the fresh-load / low-prompt
+    figure, taken right after warmup and before any fill request."""
+    n = max(1, int(hz * duration_s))
+    t0 = time.monotonic()
+    xs = []
+    for i in range(n):
+        b = read_fn()
+        if b is not None:
+            xs.append(b / GIB)
+        delay = t0 + (i + 1) / hz - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+    if not xs:
+        raise RuntimeError(f"baseline sampling: sysfs VRAM counter unreadable "
+                           f"({VRAM_SYSFS_USED})")
+    return {
+        "gib": round(sum(xs) / len(xs), 3),
+        "min_gib": round(min(xs), 3),
+        "max_gib": round(max(xs), 3),
+        "samples": len(xs),
+        "hz": hz,
+        "duration_s": duration_s,
+    }
+
+
+# Base paragraph for the fill prompts. The run seed + level number defeat the
+# server's KV prefix-cache reuse (same anti-repetition style as the
+# throughput variants): every level's prompt is independent, so no level's
+# prefill is served from a previous level's cached KV.
+FILL_PARAGRAPH = (
+    "Calibration record {seed}-{level}: payload {n1} kg on dock {n2} scanned "
+    "at {n3} parcels per hour while line {n4} ran at {n5} percent utilization "
+    "and the sorter cleared {n6} items per cycle with a mis-sort rate of "
+    "{n7} percent. Operator log for shift {n8} notes {n9} exceptions, "
+    "{n10} re-sequences and a belt speed of {n11} meters per second across "
+    "{n12} conveyor segments. "
+)
+
+
+def build_fill_base(run_seed: int, level_pct: int) -> str:
+    """Deterministic per (run_seed, level): a small LCG over the paragraph's
+    numbers, so the text is stable for a given run+level but differs across
+    levels and across runs."""
+    state = (run_seed * 1000003 + level_pct * 7919) % (2 ** 31)
+    nums = []
+    for _ in range(12):
+        state = (state * 1103515245 + 12345) % (2 ** 31)
+        nums.append(100 + state % 890)
+    kw = {f"n{i}": n for i, n in enumerate(nums, 1)}
+    return FILL_PARAGRAPH.format(seed=run_seed, level=level_pct, **kw)
+
+
+def size_prompt_to_tokens(tokenize_fn, base: str, target_tokens: int,
+                          max_tail: int = 4000) -> tuple[str, int]:
+    """Repeat `base` and trim/extend it until the text tokenizes to AT LEAST
+    target_tokens (the acceptance bar: the fill prompt reaches >= n_ctx −
+    reserve). BPE is not prefix-stable (a merge later in the string can
+    re-tokenize earlier text), so the count is only ~monotone with a small
+    sawtooth — exact equality is not reliably achievable. Strategy: size the
+    canvas from a measured tokens-per-char rate (calibration pass), then find
+    the first crossing of target — binary search when already at/over (hi
+    keeps the count>=target invariant), chunked 50-char probes + binary
+    search within the crossing chunk when under. Overshoot is bounded by the
+    sawtooth (a few tokens)."""
+    if target_tokens < 1:
+        raise ValueError("target_tokens must be >= 1")
+    per_rep = len(tokenize_fn(base))
+    if per_rep == 0:
+        raise RuntimeError("fill base paragraph tokenized to 0 tokens")
+    reps0 = max(1, target_tokens // per_rep)
+    text = base * reps0
+    L, c = len(text), len(tokenize_fn(text))
+    if c < target_tokens:
+        # A single rep underestimates the long-string rate by the per-boundary
+        # sawtooth (~2%); one calibration pass removes the bias, so the canvas
+        # lands within a word or two of the true crossing.
+        rate = c / L
+        need_chars = int(target_tokens / rate) + 2 * len(base)
+        reps = max(reps0, -(-need_chars // len(base)))  # ceil
+        text = base * reps
+        L, c = len(text), len(tokenize_fn(text))
+    if c >= target_tokens:
+        lo, hi = 0, L  # count("") = 0 < target; count(text) >= target
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if len(tokenize_fn(text[:mid])) >= target_tokens:
+                hi = mid
+            else:
+                lo = mid
+        L = hi
+        c = len(tokenize_fn(text[:L]))
+        return text[:L], c
+    walked = 0
+    while c < target_tokens:
+        if walked >= max_tail:
+            break  # stuck below target — the caller logs a WARNING
+        L2 = min(L + 50, L + (max_tail - walked))
+        c2 = len(tokenize_fn(text[:L2]))
+        walked += L2 - L
+        if c2 >= target_tokens:
+            lo, hi = L, L2  # count(text[:L]) < target; count(text[:L2]) >= target
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if len(tokenize_fn(text[:mid])) >= target_tokens:
+                    hi = mid
+                else:
+                    lo = mid
+            L = hi
+            c = len(tokenize_fn(text[:L]))
+            break
+        L, c = L2, c2
+    return text[:L], c
+
+
+def vram_level_tokens(n_ctx: int, reserve: int, level_pct: int) -> int:
+    """Target prompt tokens for a fill level. 100% = n_ctx − reserve (the
+    response reserve is left free); lower levels are a plain % of n_ctx."""
+    if level_pct == 100:
+        return max(1, n_ctx - reserve)
+    return max(1, int(n_ctx * level_pct / 100))
+
+
+def read_n_ctx_from_preset(preset_path: Path, model: str) -> int | None:
+    """The `c` line of the model's section in the active preset — the source
+    of truth for n_ctx (the server is created from this file)."""
+    try:
+        text = preset_path.read_text()
+    except OSError:
+        return None
+    m = re.search(rf"^\[{re.escape(model)}\]\s*$(.*?)(?=^\[|\Z)",
+                  text, re.M | re.S)
+    if not m:
+        return None
+    c = re.search(r"^\s*c\s*=\s*(\d+)", m.group(1), re.M)
+    return int(c.group(1)) if c else None
+
+
+def props_n_ctx(model: str, timeout: float = 10.0) -> int | None:
+    """Cross-check only: the current builds' /props exposes no n_ctx field,
+    so this usually returns None (recorded in the JSON either way)."""
+    try:
+        p = http_get_json(BASE_URL + f"/props?model={model}", timeout=timeout)
+    except Exception:
+        return None
+    for key in ("n_ctx", "n_ctx_runtime"):
+        if isinstance(p.get(key), int):
+            return p[key]
+    return None
+
+
+def parse_log_free_mib(log_text: str) -> float | None:
+    """Latest '… MiB free on ROCm0' figure from the server log (post-hoc
+    cross-check of the sysfs peak — event-based, not a live source)."""
+    lines = [l for l in log_text.splitlines() if "MiB free on ROCm0" in l]
+    if not lines:
+        return None
+    m = re.search(r"([\d.]+)\s+MiB free on ROCm0", lines[-1])
+    return float(m.group(1)) if m else None
+
+
+def docker_log_free_mib() -> float | None:
+    p = subprocess.run(["docker", "logs", SERVICE], capture_output=True,
+                       text=True, cwd=REPO_ROOT)
+    if p.returncode != 0:
+        return None
+    return parse_log_free_mib(p.stdout + "\n" + p.stderr)
+
+
+def run_vram(model: str, args, out_path: Path) -> dict:
+    """Per-config VRAM headroom step: baseline sample, then the fill ladder
+    (ascending — n_tokens_max is a high-water mark, so each level's
+    cross-check reads ≈ its own prompt length). Flushes after every level; a
+    crash never loses finished levels."""
+    levels = args.vram_levels
+    run_seed = int(time.time()) % 100000
+    total_gib = read_vram_total_gib()
+
+    log(f"vram step: baseline sampling (~2 s @ {VRAM_POLL_HZ:.0f} Hz)...")
+    baseline = sample_vram_baseline(read_vram_bytes)
+    log(f"  baseline {baseline['gib']:.3f} GiB ({baseline['samples']} samples, "
+        f"range {baseline['min_gib']:.3f}\u2013{baseline['max_gib']:.3f})")
+
+    preset = ACTIVE_INI.resolve() if ACTIVE_INI.is_symlink() else ACTIVE_INI
+    n_ctx = read_n_ctx_from_preset(preset, model)
+    if n_ctx is None:
+        raise RuntimeError(f"no 'c' line for {model} in {preset}")
+    pctx = props_n_ctx(model)
+    if pctx is not None and pctx != n_ctx:
+        log(f"  WARNING: /props n_ctx={pctx} != preset c={n_ctx} — using the preset")
+
+    vram = {
+        "baseline_gib": baseline["gib"],
+        "baseline": baseline,
+        "n_ctx": n_ctx,
+        "props_n_ctx": pctx,
+        "reserve_tokens": args.vram_reserve,
+        "total_gib": round(total_gib, 3) if total_gib is not None else None,
+        "levels": [],
+        "poller": {"hz": VRAM_POLL_HZ, "samples": 0},
+        "cross_check": {},
+    }
+
+    for pct in levels:
+        target = vram_level_tokens(n_ctx, args.vram_reserve, pct)
+        log(f"vram level {pct}%: sizing fill prompt to {target} tokens...")
+        base = build_fill_base(run_seed, pct)
+        prompt, n_tok = size_prompt_to_tokens(lambda t: tokenize(model, t),
+                                              base, target)
+        if n_tok < target:
+            log(f"  WARNING: fill prompt only {n_tok} tokens (target {target}) — "
+                f"sizing walk did not reach the target")
+        else:
+            log(f"  fill prompt: {n_tok} tokens (target {target}, "
+                f"overshoot {n_tok - target})")
+        save_json(out_path, {"vram": vram})  # flush before the long fill request
+        log(f"  fill request: {len(prompt)} chars, {n_tok} tokens, "
+            f"max_tokens=256, poller {VRAM_POLL_HZ:.0f} Hz...")
+        poller = VramPoller(read_vram_bytes, hz=VRAM_POLL_HZ)
+        poller.start()
+        t0 = time.monotonic()
+        r = stream_chat(model, prompt, max_tokens=256, timeout=args.request_timeout)
+        wall = time.monotonic() - t0
+        samples = poller.stop()
+        peak_bytes = max((b for _, b in samples), default=None)
+        peak_gib = round(peak_bytes / GIB, 3) if peak_bytes is not None else None
+        # Authoritative cross-check: the prompt_tokens the SERVER actually
+        # processed for THIS request (per-request usage). Unlike n_tokens_max
+        # (a high-water mark a concurrent session can inflate — see the
+        # 04.11.2026 contaminated run, where the worker's own ~127k context
+        # masked the fill prompts), this is per-request, so it stays valid
+        # even if other traffic shares the server. n_tok (/tokenize) is the
+        # intended size; usage_prompt_tokens is what the server saw.
+        usage_pt = (r["usage"] or {}).get("prompt_tokens")
+        if usage_pt is not None and usage_pt < target:
+            log(f"  WARNING: server processed only {usage_pt} prompt tokens "
+                f"(target {target}) — the fill did not reach the intended size")
+        n_max = get_n_tokens_max(model)
+        lvl = {
+            "fill_pct": pct,
+            "prompt_tokens": n_tok,
+            "usage_prompt_tokens": usage_pt,
+            "peak_gib": peak_gib,
+            "headroom_gib": (round(vram["total_gib"] - peak_gib, 3)
+                             if vram["total_gib"] is not None and peak_gib is not None
+                             else None),
+            "delta_vs_baseline_gib": (round(peak_gib - baseline["gib"], 3)
+                                      if peak_gib is not None else None),
+            "n_tokens_max": n_max,
+            "wall_s": round(wall, 1),
+            "samples": len(samples),
+            "finish_reason": r["finish_reason"],
+        }
+        vram["levels"].append(lvl)
+        vram["poller"]["samples"] += len(samples)
+        save_json(out_path, {"vram": vram})  # per-level flush
+        log(f"  level {pct}%: peak {lvl['peak_gib']} GiB (headroom "
+            f"{lvl['headroom_gib']} GiB, \u0394 baseline {lvl['delta_vs_baseline_gib']} "
+            f"GiB), usage_prompt_tokens={usage_pt}, n_tokens_max={n_max}, "
+            f"wall {wall:.0f}s, finish={r['finish_reason']}")
+
+    vram["cross_check"]["log_free_mib"] = docker_log_free_mib()
+    return vram
+
+
 # ── Summary / history ─────────────────────────────────────────────────────────
 
 def _mean(xs):
     xs = [x for x in xs if x is not None]
     return sum(xs) / len(xs) if xs else None
+
+
+def _vram_peak_headroom(v: dict) -> tuple:
+    """Peak = max over levels (the 100% fill); headroom = total − peak."""
+    peaks = [lv["peak_gib"] for lv in v.get("levels", [])
+             if lv.get("peak_gib") is not None]
+    if not peaks:
+        return None, None
+    peak = max(peaks)
+    total = v.get("total_gib")
+    headroom = round(total - peak, 3) if total is not None else None
+    return peak, headroom
 
 
 def config_stats(data: dict) -> dict:
@@ -795,6 +1233,9 @@ def write_summary(outdir: Path, results: dict) -> None:
     def fmt_pct(x):
         return f"{x:+.1f}%" if x is not None else "\u2014"
 
+    def fmt_abs(x):
+        return f"{x:+.2f}" if x is not None else "\u2014"
+
     def fmt_val(x, spec):
         return format(x, spec) if x is not None else "\u2014"
 
@@ -802,29 +1243,83 @@ def write_summary(outdir: Path, results: dict) -> None:
     for name, data in results.items():
         s = config_stats(data)
         stats[name] = s
-        lines.append(
-            f"| {name} | {data['image']} | {data['model']} "
-            f"| {fmt_val(s['prefill_tps'], '.1f')} | {fmt_val(s['decode_tps'], '.1f')} | {fmt_val(s['ttft_s'], '.2f')} "
-            f"| {fmt_val(s['draft_accept'], '.3f')} | {fmt_val(s['eval_pass'], '.0%')} | {s['n_reps']} |"
-        )
-
-    # ── Deltas vs vanilla: one row per non-vanilla config, all metrics ──
-    lines += ["", "## Deltas vs vanilla (llama-cpp-rocm:latest)", ""]
-    if "vanilla" in stats:
-        v = stats["vanilla"]
-        lines.append("| config | decode t/s | \u0394 decode | prefill t/s | \u0394 prefill | TTFT s | \u0394 TTFT | draft acc | eval pass |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for name, s in stats.items():
-            if name == "vanilla":
-                continue
+        if data.get("failed"):
             lines.append(
-                f"| {name} | {fmt_val(s['decode_tps'], '.1f')} | {fmt_pct(pct_delta(v['decode_tps'], s['decode_tps']))} "
-                f"| {fmt_val(s['prefill_tps'], '.1f')} | {fmt_pct(pct_delta(v['prefill_tps'], s['prefill_tps']))} "
-                f"| {fmt_val(s['ttft_s'], '.2f')} | {fmt_pct(pct_delta(v['ttft_s'], s['ttft_s']))} "
-                f"| {fmt_val(s['draft_accept'], '.3f')} | {fmt_val(s['eval_pass'], '.0%')} |"
+                f"| {name} | {data['image']} | {data['model']} "
+                f"| FAILED | FAILED | FAILED | FAILED | FAILED | {s['n_reps']} |"
             )
-    else:
-        lines.append("(vanilla config not in this run \u2014 nothing to compare against)")
+        else:
+            lines.append(
+                f"| {name} | {data['image']} | {data['model']} "
+                f"| {fmt_val(s['prefill_tps'], '.1f')} | {fmt_val(s['decode_tps'], '.1f')} | {fmt_val(s['ttft_s'], '.2f')} "
+                f"| {fmt_val(s['draft_accept'], '.3f')} | {fmt_val(s['eval_pass'], '.0%')} | {s['n_reps']} |"
+            )
+
+    # ── Deltas vs baseline: one row per non-baseline config, all metrics ──
+    # Baseline = the first config in the run (vanilla in the 3-way set;
+    # rdna-r176 in the 2-way r176-vs-r205 set). The Deltas row answers
+    # "does the rebuild win?" against whatever the run's first leg is.
+    baseline = next(iter(stats))
+    lines += ["", f"## Deltas vs {baseline} ({results[baseline]['image']})", ""]
+    v = stats[baseline]
+    vram = {name: d["vram"] for name, d in results.items() if d.get("vram")}
+    vram_ph = {name: _vram_peak_headroom(d) for name, d in vram.items()}
+    has_vram = any(p is not None for p, _ in vram_ph.values())
+    hdr = ("| config | decode t/s | \u0394 decode | prefill t/s | \u0394 prefill "
+           "| TTFT s | \u0394 TTFT | draft acc | eval pass")
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+    if has_vram:
+        hdr += " | peak GiB | \u0394 peak | headroom GiB | \u0394 headroom |"
+        sep += "---:|" * 4
+    lines.append(hdr)
+    lines.append(sep)
+    for name, s in stats.items():
+        if name == baseline:
+            continue
+        row = (
+            f"| {name} | {fmt_val(s['decode_tps'], '.1f')} | {fmt_pct(pct_delta(v['decode_tps'], s['decode_tps']))} "
+            f"| {fmt_val(s['prefill_tps'], '.1f')} | {fmt_pct(pct_delta(v['prefill_tps'], s['prefill_tps']))} "
+            f"| {fmt_val(s['ttft_s'], '.2f')} | {fmt_pct(pct_delta(v['ttft_s'], s['ttft_s']))} "
+            f"| {fmt_val(s['draft_accept'], '.3f')} | {fmt_val(s['eval_pass'], '.0%')}"
+        )
+        if has_vram:
+            bp, bh = vram_ph.get(baseline, (None, None))
+            np_, nh = vram_ph.get(name, (None, None))
+            row += (f" | {fmt_val(np_, '.2f')} | {fmt_abs(np_ - bp if np_ is not None and bp is not None else None)} "
+                    f"| {fmt_val(nh, '.2f')} | {fmt_abs(nh - bh if nh is not None and bh is not None else None)}")
+        lines.append(row + " |")
+
+    # ── VRAM headroom: baseline / peak@100% / headroom per config + ladder ──
+    # Answers "how much VRAM headroom is left to increase the context limit?"
+    # and (via the Deltas row above) "does r205 use less VRAM than r176 at the
+    # same context limit?".
+    if vram:
+        lines += ["", "## VRAM headroom (eGPU card1, live sysfs poller)", ""]
+        lines.append("KV is pre-allocated for n_ctx \u2192 a flat ladder is expected; the 100% fill "
+                     "(n_ctx \u2212 reserve) is the steady-state peak. Headroom = card total \u2212 peak: "
+                     "the margin before the n_ctx wall (OOM).")
+        lines.append("")
+        lines.append("| config | baseline GiB | peak GiB | headroom GiB | \u0394 vs baseline GiB | n_ctx |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for name, d in vram.items():
+            peak, headroom = vram_ph[name]
+            b = d.get("baseline_gib")
+            dv = round(peak - b, 3) if peak is not None and b is not None else None
+            lines.append(
+                f"| {name} | {fmt_val(b, '.2f')} | {fmt_val(peak, '.2f')} "
+                f"| {fmt_val(headroom, '.2f')} | {fmt_abs(dv)} | {d.get('n_ctx', '\u2014')} |"
+            )
+        pcts = sorted({lv["fill_pct"] for d in vram.values()
+                       for lv in d.get("levels", [])})
+        if pcts:
+            lines += ["", "### Ladder (peak GiB per fill level \u2014 flat = pre-allocated KV)", ""]
+            lines.append("| config | " + " | ".join(f"{p}%" for p in pcts) + " |")
+            lines.append("|---|" + "---:|" * len(pcts))
+            for name, d in vram.items():
+                by_pct = {lv["fill_pct"]: lv.get("peak_gib")
+                          for lv in d.get("levels", [])}
+                lines.append("| " + name + " | " +
+                             " | ".join(fmt_val(by_pct.get(p), '.2f') for p in pcts) + " |")
 
     # ── Within-rdna matrix: lower triangle, row = baseline, cell = \u0394 decode % ──
     rdna_names = [n for n in stats if n != "vanilla"]
@@ -874,23 +1369,43 @@ def write_summary(outdir: Path, results: dict) -> None:
     log(f"summary written: {outdir / 'summary.md'}")
 
 
+HISTORY_HEADER = ["timestamp", "config", "image", "model", "prefill_tps", "decode_tps",
+                  "ttft_s", "draft_accept", "eval_pass", "n_reps", "gen_tokens",
+                  "peak_vram_gib", "headroom_gib"]
+
+
+def _migrate_history_header(hist: Path) -> None:
+    """One-time header migration: older history.csv files lack the VRAM
+    columns — extend the header in place (old rows stay ragged, standard for
+    CSV evolution)."""
+    if not hist.exists():
+        return
+    lines = hist.read_text().splitlines()
+    if lines and "peak_vram_gib" not in lines[0]:
+        lines[0] = lines[0].rstrip() + ",peak_vram_gib,headroom_gib"
+        hist.write_text("\n".join(lines) + "\n")
+
+
 def append_history(outdir: Path, results: dict) -> None:
     hist = outdir.parent / "history.csv"
     new = not hist.exists()
+    _migrate_history_header(hist)
     with hist.open("a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["timestamp", "config", "image", "model", "prefill_tps", "decode_tps",
-                        "ttft_s", "draft_accept", "eval_pass", "n_reps", "gen_tokens"])
+            w.writerow(HISTORY_HEADER)
         for name, data in results.items():
             s = config_stats(data)
+            peak, headroom = _vram_peak_headroom(data.get("vram") or {})
             w.writerow([now_iso(), name, data["image"], data["model"],
                         f"{s['prefill_tps']:.2f}" if s["prefill_tps"] else "",
                         f"{s['decode_tps']:.2f}" if s["decode_tps"] else "",
                         f"{s['ttft_s']:.3f}" if s["ttft_s"] else "",
                         f"{s['draft_accept']:.4f}" if s["draft_accept"] is not None else "",
                         f"{s['eval_pass']:.2f}" if s["eval_pass"] is not None else "",
-                        s["n_reps"], data.get("gen_tokens", "")])
+                        s["n_reps"], data.get("gen_tokens", ""),
+                        f"{peak:.3f}" if peak is not None else "",
+                        f"{headroom:.3f}" if headroom is not None else ""])
     log(f"history appended: {hist}")
 
 
@@ -987,6 +1502,113 @@ def selftest() -> int:
     t("length ~4k tokens (12k-24k chars)", 12000 <= len(p0) <= 24000)
     t("5 variants", len({build_throughput_prompt(i) for i in range(5)}) == 5)
 
+    print("selftest: preset selection (ini_for_image)")
+    t("vanilla image -> vanilla preset",
+      ini_for_image("llama-cpp-rocm:latest") == INI_VANILLA)
+    t("production rdna image -> rdna preset",
+      ini_for_image("llama-cpp-rocm:rdna") == INI_RDNA)
+    t("kept rdna-r110 image -> rdna preset (not vanilla)",
+      ini_for_image("llama-cpp-rocm:rdna-r110") == INI_RDNA)
+    t("future rdna-r176 image -> rdna preset",
+      ini_for_image("llama-cpp-rocm:rdna-r176") == INI_RDNA)
+
+    print("selftest: vram poller")
+    counter = {"n": 0}
+
+    def fake_read():
+        counter["n"] += 1
+        return GIB * counter["n"]
+
+    poller = VramPoller(fake_read, hz=50.0)
+    poller.start()
+    time.sleep(0.3)
+    samples = poller.stop()
+    t("poller collected samples", len(samples) >= 5)
+    t("poller timestamps monotonic",
+      all(a[0] <= b[0] for a, b in zip(samples, samples[1:])))
+    t("poller bytes come from read fn",
+      samples and [b for _, b in samples] == [GIB * i for i in range(1, len(samples) + 1)])
+
+    print("selftest: vram baseline sampling")
+    base = sample_vram_baseline(lambda: 2 * GIB, hz=50.0, duration_s=0.2)
+    t("baseline mean ~2 GiB", abs(base["gib"] - 2.0) < 0.01)
+    t("baseline sample count", 5 <= base["samples"] <= 12)
+    t("baseline min==max for constant read", base["min_gib"] == base["max_gib"])
+
+    print("selftest: fill prompt builder + sizing")
+    b0 = build_fill_base(42, 100)
+    t("fill base deterministic", build_fill_base(42, 100) == b0)
+    t("fill base differs per level", build_fill_base(42, 25) != b0)
+    t("fill base differs per seed", build_fill_base(43, 100) != b0)
+
+    def fake_tokenize(text):
+        return list(text)  # 1 token per char
+
+    text, n = size_prompt_to_tokens(fake_tokenize, b0, 100)
+    t("sized to exact token count", n == 100)
+    t("sized text is a prefix of the repeated base", text in b0 * 10)
+    text2, n2 = size_prompt_to_tokens(fake_tokenize, b0, 10)  # < one rep
+    t("sizes below one rep", n2 == 10 and len(text2) == 10)
+
+    print("selftest: vram level targets")
+    t("100% -> n_ctx - reserve", vram_level_tokens(145000, 2048, 100) == 145000 - 2048)
+    t("75% -> 0.75 * n_ctx", vram_level_tokens(145000, 2048, 75) == 108750)
+    t("25% -> 0.25 * n_ctx", vram_level_tokens(145000, 2048, 25) == 36250)
+
+    print("selftest: n_tokens_max parsing")
+    t("parses metric value",
+      parse_n_tokens_max("# HELP x y\nllamacpp:n_tokens_max 96800\n") == 96800)
+    t("absent -> None", parse_n_tokens_max("llamacpp:other 1\n") is None)
+
+    print("selftest: docker log free MiB parsing")
+    t("latest free line wins",
+      parse_log_free_mib("a 100.0 MiB free on ROCm0\nb 1722.0 MiB free on ROCm0") == 1722.0)
+    t("no free line -> None", parse_log_free_mib("nothing here") is None)
+
+    print("selftest: preset n_ctx parsing")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "preset.ini"
+        p.write_text("[*]\nc = 1\n\n[egpu-SWIFT-1.5]\nc = 145000\nmodel = /m.gguf\n\n[other]\nc = 9999\n")
+        t("reads the model's c line", read_n_ctx_from_preset(p, "egpu-SWIFT-1.5") == 145000)
+        t("other model section", read_n_ctx_from_preset(p, "other") == 9999)
+        t("missing model -> None", read_n_ctx_from_preset(p, "nope") is None)
+
+    print("selftest: summary vram rows")
+    fake_results = {
+        "rdna-r176": {
+            "image": "llama-cpp-rocm:rdna-r176", "model": "egpu-SWIFT-1.5",
+            "throughput": {"reps": []}, "eval": [],
+            "vram": {"baseline_gib": 23.16, "n_ctx": 145000, "total_gib": 24.0,
+                     "levels": [
+                         {"fill_pct": 50, "prompt_tokens": 72500, "peak_gib": 23.73,
+                          "headroom_gib": 0.27, "delta_vs_baseline_gib": 0.57,
+                          "n_tokens_max": 72500, "wall_s": 60.0},
+                         {"fill_pct": 100, "prompt_tokens": 142952, "peak_gib": 23.73,
+                          "headroom_gib": 0.27, "delta_vs_baseline_gib": 0.57,
+                          "n_tokens_max": 142952, "wall_s": 119.0}]},
+        },
+        "rdna-r205": {
+            "image": "llama-cpp-rocm:rdna", "model": "egpu-SWIFT-1.5",
+            "throughput": {"reps": []}, "eval": [],
+            "vram": {"baseline_gib": 23.15, "n_ctx": 145000, "total_gib": 24.0,
+                     "levels": [
+                         {"fill_pct": 50, "prompt_tokens": 72500, "peak_gib": 23.71,
+                          "headroom_gib": 0.29, "delta_vs_baseline_gib": 0.56,
+                          "n_tokens_max": 72500, "wall_s": 60.0},
+                         {"fill_pct": 100, "prompt_tokens": 142952, "peak_gib": 23.71,
+                          "headroom_gib": 0.29, "delta_vs_baseline_gib": 0.56,
+                          "n_tokens_max": 142952, "wall_s": 119.0}]},
+        },
+    }
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        write_summary(out, fake_results)
+        s = (out / "summary.md").read_text()
+    t("vram section present", "## VRAM headroom" in s)
+    t("vram table has per-config peak", "| rdna-r205 |" in s and "23.71" in s)
+    t("deltas row carries peak delta", "\u0394 peak" in s)
+    t("ladder table present", "### Ladder" in s)
+
     if failures:
         print(f"\nselftest: {len(failures)} FAILURE(S): {failures}")
         return 1
@@ -996,11 +1618,22 @@ def selftest() -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def parse_ladder(s: str) -> list:
+    try:
+        vals = [int(x) for x in s.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"ladder must be comma-separated ints, got {s!r}")
+    if not vals or any(not 1 <= v <= 100 for v in vals):
+        raise argparse.ArgumentTypeError("ladder levels must be ints in 1..100")
+    return sorted(set(vals))
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--configs", default="vanilla,rdna-adaptive",
-                   help="comma-separated subset of: vanilla,rdna-adaptive")
+    p.add_argument("--configs", default="rdna-r176,rdna-r205",
+                   help="comma-separated subset of: rdna-r176,rdna-r205")
     p.add_argument("--no-switch", action="store_true",
                    help="benchmark only the currently running image/model (no .env edits, no recreations)")
     p.add_argument("--reps", type=int, default=5, help="throughput reps (default 5)")
@@ -1017,6 +1650,17 @@ def parse_args():
                         "for host-mapped input embeddings: a jump in MTP t/s "
                         "means the confound was present. Results land in "
                         "config-<name>-omp.json.")
+    p.add_argument("--vram", action="store_true",
+                   help="run the VRAM headroom step per config (live sysfs "
+                        "poller at 10 Hz; fill prompt sized to n_ctx \u2212 "
+                        "reserve; the 100%% fill is the peak, the ladder a "
+                        "confirmation of the flat pre-allocated-KV shape)")
+    p.add_argument("--vram-ladder", type=parse_ladder, default=None, metavar="PCTS",
+                   help="comma-separated fill levels as %% of n_ctx, ascending "
+                        "(default 100; e.g. 25,50,75,100)")
+    p.add_argument("--vram-reserve", type=int, default=2048,
+                   help="tokens left free for the response at the 100%% level "
+                        "(default 2048)")
     p.add_argument("--out", default=None,
                    help="output dir (default scripts/bench-results/<timestamp>)")
     p.add_argument("--dry-run", action="store_true", help="print the plan; no side effects")
@@ -1036,6 +1680,9 @@ def main() -> int:
     if unknown:
         sys.exit(f"ERROR: unknown config(s) {unknown}; valid: {list(by_name)}")
     configs = [by_name[w] for w in wanted]
+
+    if args.vram:
+        args.vram_levels = args.vram_ladder if args.vram_ladder else [100]
 
     outdir = Path(args.out) if args.out else \
         Path(__file__).resolve().parent / "bench-results" / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1060,6 +1707,22 @@ def main() -> int:
     print(f"  reps         : {args.reps}  (gen cap {args.gen_tokens} tokens)")
     print(f"  eval prompts : {len(eval_specs['prompts'])}  ({'skipped' if args.skip_eval else 'on'})")
     print(f"  throughput   : {'skipped' if args.skip_throughput else 'on'}")
+    if args.vram:
+        levels = args.vram_ladder if args.vram_ladder else [100]
+        n_ctx_plan = None
+        if configs:
+            try:
+                n_ctx_plan = read_n_ctx_from_preset(
+                    ACTIVE_INI.resolve() if ACTIVE_INI.is_symlink() else ACTIVE_INI,
+                    configs[0]["model"])
+            except OSError:
+                pass
+        est = ""
+        if n_ctx_plan:
+            toks = [vram_level_tokens(n_ctx_plan, args.vram_reserve, p) for p in levels]
+            est = f"  (n_ctx {n_ctx_plan}; ~{sum(toks) / 1200:.0f}s prefill at ~1200 t/s)"
+        print(f"  vram step    : on  (levels {levels} % of n_ctx, reserve "
+              f"{args.vram_reserve} tokens, poller {VRAM_POLL_HZ:.0f} Hz){est}")
     omp_note = f" + OMP passive pass on {args.omp_passive} (2 extra recreations)" if args.omp_passive else ""
     print(f"  recreations  : {n_switches if not args.no_switch else 0}{omp_note}  ({'no-switch mode' if args.no_switch else ''})")
     for i, c in enumerate(configs, 1):
@@ -1105,11 +1768,34 @@ def main() -> int:
                     "preset": active_ini_target(),
                     "gen_tokens": args.gen_tokens, "started": now_iso()}
             save_json(out_path, data)
-            run_warmup(c["model"])
-            if not args.skip_throughput:
-                data["throughput"] = run_throughput(c["model"], args, out_path)
-            if not args.skip_eval:
-                data["eval"] = run_eval(c["model"], eval_specs, args, out_path)
+            # A hard server failure on ONE config (e.g. a non-working spec
+            # combination that aborts every long request -> HTTP 500) must not
+            # kill the whole run: record the config as failed and continue to
+            # the next one. (23.10.2026 spec-variants run: rdna-adaptive-recall
+            # aborted every long request and the unguarded exception skipped
+            # configs 4-6.) switch_to stays OUTSIDE this guard — a container
+            # switch failure is run-fatal, not per-config.
+            try:
+                run_warmup(c["model"])
+                if args.vram:
+                    # Right after warmup, BEFORE throughput/eval: the baseline
+                    # must be the fresh-load / low-prompt figure, and the fill
+                    # requests must not be confounded by the KV state of the
+                    # earlier steps.
+                    data["vram"] = run_vram(c["model"], args, out_path)
+                if not args.skip_throughput:
+                    data["throughput"] = run_throughput(c["model"], args, out_path)
+                if not args.skip_eval:
+                    data["eval"] = run_eval(c["model"], eval_specs, args, out_path)
+            except Exception as e:
+                data["failed"] = True
+                data["error"] = f"{type(e).__name__}: {e}"
+                data["ended"] = now_iso()
+                save_json(out_path, data)
+                results[c["name"]] = data
+                log(f"ERROR: config {c['name']} failed: {e} — recording as "
+                    f"failed, continuing to next config")
+                continue
             data["ended"] = now_iso()
             save_json(out_path, data)
             results[c["name"]] = data

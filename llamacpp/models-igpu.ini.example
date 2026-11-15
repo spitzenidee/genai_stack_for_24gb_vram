@@ -13,7 +13,11 @@ version = 1
 cache-type-k = q8_0
 cache-type-v = q8_0
 flash-attn = auto
-parallel = 1
+; parallel = 2: two KV slots on the same loaded model, so concurrent iGPU
+; consumers (e.g. gromacs-sim agent brain + Hindsight memory background work)
+; run without model swap / unload / cancel. Each slot carries its own KV cache
+; (q8_0) — verify system-RAM headroom before raising further.
+parallel = 2
 context-shift = true
 no-mmap = true
 timeout = 7200

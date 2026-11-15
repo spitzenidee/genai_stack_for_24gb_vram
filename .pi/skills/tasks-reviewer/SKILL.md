@@ -47,7 +47,7 @@ The orchestrator already picked the card: your entry prompt names the
 
 ## Tag lifecycle (request/ack model)
 
-Two tags with distinct roles:
+Three tags with distinct roles:
 
 - `review-by-ai` — "AI review requested / ready for AI review" (a *request*
   flag). Added by whoever (re)submits the card to Review (implementer or
@@ -56,14 +56,25 @@ Two tags with distinct roles:
 - `ai-reviewed` — "AI review completed, no noteworthy issues" (a *state*
   flag, for the human). Added by the reviewer **only on a clean pass**.
   Informational — not part of eligibility.
+- `merge-pending` — "clean pass on a repo implementation card, merge to the
+  base branch requested" (a *request* flag for the implementer). Added by
+  the reviewer on a clean pass of a repo implementation card; **removed by
+  the implementer after the merge & push step** (tasks-implementer, *Merge
+  & push*). Never set by hand.
+
+**All tag changes go through `tmd tag`** (e.g. `tmd tag <card> --remove
+review-by-ai --add ai-reviewed`) — never `tmd edit`/`sed` on line 1. `tmd
+tag` owns the canonical one-group-per-tag format and is idempotent.
 
 | Step | Actor | Tag changes | Lane |
 |---|---|---|---|
 | 1. (Re)submit to Review | implementer / human | + `review-by-ai` (ensure `ai-reviewed` absent) | → `Review` |
-| 2a. Review finds issues | reviewer | − `review-by-ai` | → top of `Ready` |
-| 2b. Review finds no issues | reviewer | − `review-by-ai`, + `ai-reviewed` | stays in `Review` |
+| 2a. Review finds blocking issues | reviewer | − `review-by-ai` | → top of `Ready` |
+| 2b. Clean pass, repo implementation card | reviewer | − `review-by-ai`, + `ai-reviewed`, + `merge-pending` | → top of `Ready` (merge step) |
+| 2c. Clean pass, spec/research or no-repo card | reviewer | − `review-by-ai`, + `ai-reviewed` | stays in `Review` |
 | 3. Fix + re-submit (after 2a) | implementer | + `review-by-ai` (ensure `ai-reviewed` absent) | → `Review` |
-| 4. Human approves (after 2b) | human | — | → `Done` |
+| 3b. Merge + push (after 2b) | implementer | − `merge-pending` (if the merge changed code: − `ai-reviewed`, + `review-by-ai`) | → `Review` |
+| 4. Human approves (after 2c / 3b) | human | — | → `Done` |
 
 **Loop prevention:** the reviewer removes `review-by-ai` on completion, so a
 card cannot be re-reviewed until it is re-submitted (step 3 re-adds it).
@@ -76,9 +87,9 @@ Before reviewing the content, run the vulnerability scan if warranted
 - **Trigger:** the card is tagged `vuln-scan` on line 1, **or** the
   reviewer judges a scan warranted (safety net — e.g. the change touches
   code/containers/scripts and the tag is missing).
-- **Run:** `.pi/skills/vuln-scan/scripts/vuln-scan.sh repo <repo>`
-  (default: the stack root). If the card touched a Dockerfile / built an
-  image, also run `vuln-scan image <name>`.
+- **Run:** the `vuln-scan` skill's `repo` command (see the `vuln-scan`
+  skill for the exact path and usage; default: the stack root). If the card
+  touched a Dockerfile / built an image, also run its `image` command.
 - **Record:** add a `**Vuln-scan:**` line to the `## Review` section —
   count by severity + the findings that are in the card's **changed**
   files (the actionable ones). The full JSON stays in
@@ -87,7 +98,10 @@ Before reviewing the content, run the vulnerability scan if warranted
 - **Verdict guidance:** CRITICAL/HIGH findings in the card's changed code
   = **blocker** (row in the findings table). Pre-existing MEDIUM findings
   = noted in the `**Vuln-scan:**` line, not blocking.
-- Pure spec/content/GROMACS/Blender cards with no tag → no scan.
+- Cards that touch no code, containers, scripts, or dependencies → no scan
+  (regardless of project type). The `vuln-scan` tag is the primary trigger;
+  the reviewer's judgment is a safety net only for code-touching cards where
+  the tag is missing — it must not fire on pure spec/content/docs cards.
 
 ## Review protocol
 
@@ -106,23 +120,44 @@ Review the implementation from **all angles**:
   non-`[old-format]` failures (chronology, duplicates) and `[old-format]`
   entries among the **most recent** log lines (a new malformed entry that
   slipped through) are actionable.
+- **refinement-section invariant (mechanical)**: a card in `Review` must
+  **not** contain a `## Refinement` section — the refiner's disposable
+  section is removed before a card is ever submitted to Review (the
+  step-9 invariant of the refinement flow, `tasks-refiner`). If one is
+  present → **blocking** finding (the card reached Review un-refined /
+  mid-refinement).
 - leftover TODOs
 
-**Two outcomes:**
+**Repo cards:** the code lives at `work/orchestrator/<name>` (tasks-board,
+*Repo workflow*) — review it there, read-only. When the entry prompt notes
+the session cwd is the repo checkout, the code lives at `.` (same rule —
+tasks-board, *Worker cwd for repo cards*).
+
+**Non-implementation cards** (`spec` / `research` — no code to review):
+- `spec`: is it **executable by a fresh implementer without questions**? Do
+  the code anchors match the repo's actual state? Are decisions closed and
+  constraints stated? Is it self-contained?
+- `research`: are the claims **evidenced** (cited sources, verified system
+  state)? Are the options complete and the recommendations sound? Did the
+  card stay read-only (no repo writes)?
+
+**Outcomes (blocking threshold: `blocker`/`major` block; `minor`/`nit` do not):**
 
 | Outcome | Tag changes | Card content | Lane |
 |---|---|---|---|
-| Issues found | − `review-by-ai` | `## Review` (findings table) + `**Review**` log entry | → **top of `Ready`** (fix runs next) |
-| No issues | − `review-by-ai`, + `ai-reviewed` | `## Review` ("no issues" + what was validated) + `**Review**` log entry | stays in `Review` (human → Done) |
+| Blocking issues (≥1 `blocker` or `major`) | − `review-by-ai` | `## Review` (findings table) + `**Review**` log entry | → **top of `Ready`** (fix runs next) |
+| Clean pass (only `minor`/`nit`, or no issues) | − `review-by-ai`, + `ai-reviewed` (+ `merge-pending` for repo implementation cards) | `## Review` (findings recorded, non-blocking / "no issues" + what was validated) + `**Review**` log entry | see *Applying the outcome* |
 
 **"No issues" is a first-class, valid outcome.** A clean pass is acceptable —
-do not manufacture findings.
+do not manufacture findings. Card-level issues (log lines, formatting, nits)
+are **recorded, not blocking**: the verdict line says `**Verdict:** 0
+blocking (N minor, recorded)`.
 
 ### `## Review` section format
 
 ```markdown
 ## Review — DD.MM.YYYY HH:MM
-**Verdict:** N issues (X blocker)
+**Verdict:** N issues (X blocker)  — clean pass: `**Verdict:** 0 blocking (N minor, recorded)`
 **Vuln-scan:** CRITICAL: 0, HIGH: 0, MEDIUM: 3 (0 in changed files) — report: work/vuln_scan_results/genai_stack/<ts>-*.json  (omit the line when no scan ran)
 | # | Severity | Where | Finding | Suggested fix |
 |---|----------|-------|---------|---------------|
@@ -146,14 +181,22 @@ review tables, or log entries — refer to it as "the Log section". The
 
 ### Applying the outcome
 
-- **Issues found**: insert `## Review` **before** the Log section
+- **Blocking issues**: insert `## Review` **before** the Log section
   (`tmd insert`); append a `**Review**` log entry (`tmd append`); remove
-  `review-by-ai` from line 1 (edit the tags); `move` the card to the **top
-  of `Ready`** (`tmd to-top`); append a `**Moved** Review → Ready: reason`
-  log entry.
-- **No issues**: insert `## Review` before the Log section (`tmd insert`);
-  append a `**Review**` log entry; on line 1 remove `review-by-ai` **and add
-  `ai-reviewed`**; the card **stays in `Review`** (no lane move).
+  `review-by-ai` via **`tmd tag <card> --remove review-by-ai`**; `move` the
+  card to the **top of `Ready`** (`tmd to-top`); append a `**Moved** Review
+  → Ready: reason` log entry.
+- **Clean pass, repo implementation card**: insert `## Review` before the Log
+  section (`tmd insert`); append a `**Review**` log entry; tag via **`tmd tag
+  <card> --remove review-by-ai --add ai-reviewed --add merge-pending`**;
+  `move` the card to the **top of `Ready`** (`tmd to-top`); append a
+  `**Moved** Review → Ready: clean pass, merge pending` log entry. The
+  implementer's *Merge & push* step (tasks-implementer) returns the card to
+  Review for the human.
+- **Clean pass, spec/research or no-repo card**: insert `## Review` before
+  the Log section (`tmd insert`); append a `**Review**` log entry; tag via
+  **`tmd tag <card> --remove review-by-ai --add ai-reviewed`**; the card
+  **stays in `Review`** (no lane move, no merge step).
 
 **Re-review (D5):** a card may already carry a `## Review` section from a
 previous round. On re-review, **REPLACE** the previous `## Review` section

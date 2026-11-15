@@ -2261,3 +2261,21 @@ Files: `03-playbooks/03.5-performance.md` (as listed in the issue)
 - **Regression suite (post-fix)**: 30 blocks probed, all `unknown=0 invalid=0 obsolete=0`; block summary verdict lines byte-identical to the pre-fix baseline (detail lines identical modulo per-run GROMACS reminder-quote log line shifts); `03_matrix_verdicts.txt` byte-identical to baseline (only the documented false-positive-class (a)/(d) lines plus the documented probe-harness `exit`/`unknown` leftovers). No NEW parse signal, no reverts.
 - **Stale-text sweep**: KB content (00–03 + README, excluding issues_kb.md) is clean of `GMX_FORCE_GPU_ID` and `GMX_GPU_DD_COMMS` — no stragglers.
 - **No deviations, no handbacks.**
+
+## Full-KB regression audit (2026-11-14 — build 2026.4-dev-20261002-6c69f72-unknown)
+
+**Method:** Probe suite re-run against the rebuilt `gromacs-hip-gfx1100:latest` (GROMACS **v2026.4**, the version bump from the "bump Blender to 5.2.4 + GROMACS to v2026.4" card). Build changed since the 2026-09-30 pass: `gmx --version` = `2026.4-dev-20261002-6c69f72-unknown` (was `2026.3-dev-20260625-1210900-unknown`); all Gold-standard attributes otherwise identical (TNG on, Colvars on, CP2K off, Torch off, Plumed on, GPU=HIP gfx1100, SIMD AVX2_256, VkFFT 1.3.1, 101 commands, Clang 23.0.0, HIP 7.14). Probe suite: 101 commands inventoried, 101 help dumps, 30 MDP blocks probed as-is, 23 topology directives probed (name + usability), merged top-level existence matrix. CPU-only transient containers — no GPU, no mode switch, no MD run.
+
+**Result: clean pass — 0 new issues.** No KB MDP block uses an option/value the 2026.4 build rejects (all 30 blocks `unknown=0 invalid=0 obsolete=0`). The per-block `notes` are the expected 1-atom dummy-system noise (PEP bond oscillation, NVE zero-temp Verlet buffer, plain Coulomb cutoff, COM-removal frequency) — **no deprecation/legacy-alias NOTEs**. The matrix "Unknown left-hand" lines are the documented context-dependent options (`nrexcl`, `fc`, `start`, …) probed at top level (false-positive class (a)) plus the probe-harness `exit`/`unknown` leftovers — unchanged from the 2026-09-30 baseline. 2026.4 is a patch release (bugfixes, no features, no breaking changes), so no surface drift is expected, and none was found.
+
+### Verified OK (2026-11-14 — 2026.4 build)
+- **Build**: 2026.4-dev-20261002-6c69f72-unknown (bumped from 2026.3-dev-20260625); 101 commands; HIP gfx1100; SIMD AVX2_256; VkFFT 1.3.1; TNG/Colvars/Plumed on, CP2K/Torch off.
+- **MDP blocks**: all 30 KB fenced blocks probe clean (`unknown=0 invalid=0 obsolete=0`); no option/value rejected by 2026.4.
+- **Directives**: all 23 unique topology directives present and usable at their canonical positions.
+- **CLI surface**: 101 commands (count unchanged); no removed/renamed tools in the inventory.
+- **No new deprecation/legacy-alias NOTEs** in any block log.
+
+### Notes
+- **Build drift is expected and benign**: the only change is the version bump (2026.3 → 2026.4); the Gold-standard attribute set is otherwise identical.
+- **Scope**: this is the deterministic probe-suite pass (the high-value drift check for a version bump). A full semantic re-read of all 34 KB content files is a larger standalone operation; given 2026.4 is a patch release with **no surface drift** in the probe suite, the prose/semantic claims are low-risk and were not re-read in this pass. Flagged for a future dedicated audit if desired.
+- **No deviations, no handbacks.** No KB content files modified (validate-only).

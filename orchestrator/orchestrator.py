@@ -36,7 +36,9 @@ import urllib.parse
 import urllib.request
 
 # --------------------------------------------------------------------------
-# Tunables (constants by design — no flags, no env vars)
+# Tunables (constants by design — no flags, no env vars; the one exception:
+# the EGPU_BUSY_* overrides below, which are hardware-calibrated to this
+# host's eGPU and operator-tunable at runtime)
 # --------------------------------------------------------------------------
 BOARD_URL = "http://localhost:8090"            # tasks.md board
 EGPU_URL = "http://192.168.1.XX:8092"          # llama-server (worker brain)
@@ -44,7 +46,13 @@ EGPU_URL = "http://192.168.1.XX:8092"          # llama-server (worker brain)
 # (defaultModel / defaultProvider in ~/.pi/agent/settings.json). Note that
 # PI_MODEL / PI_PROVIDER are pi *output* vars (injected into shell tools),
 # not inputs — setting them on the worker env did nothing.
-PI_BIN = "pi"                                  # resolved via PATH at start
+# Managed pi launcher (reads ~/.pi/agent/install/current-version itself, so
+# version bumps don't touch this). Absolute path on purpose: the .bashrc PATH
+# export only exists in interactive shells, and a non-interactive launch
+# (script/cron/systemd) would otherwise fail Popen with FileNotFoundError.
+# Falls back to PATH lookup if the managed launcher is missing.
+_PI_LAUNCHER = os.path.expanduser("~/.pi/agent/bin/pi")
+PI_BIN = _PI_LAUNCHER if os.path.exists(_PI_LAUNCHER) else "pi"
 
 TICK_SECONDS = 20                  # supervisor tick interval (the only sleep)
 GRACE_SECONDS = 300                # startup grace: no kill inside this window
@@ -54,12 +62,27 @@ COOLDOWN_ONHOLD_ONLY_SECONDS = 300  # re-launch cooldown (only trigger: OnHold)
 FORCE_KILL_GRACE_SECONDS = 15      # SIGTERM -> SIGKILL grace
 HTTP_TIMEOUT_SECONDS = 5           # board / eGPU probe timeout
 
+# eGPU busy gate (the env-var exception to "constants by design"): measured
+# defaults from this host's eGPU (RX 7900 XT, drm card1) — idle baseline is
+# exactly 0%, active inference 86-93%. Each is overridable per call via the
+# same-named env var (EGPU_BUSY_BLOCK_PCT, EGPU_BUSY_RESUME_PCT,
+# EGPU_BUSY_WINDOW_SAMPLES, EGPU_BUSY_SAMPLE_INTERVAL_S), so operator changes
+# take effect without an orchestrator restart. The 5-point hysteresis band
+# (5-10) prevents flapping; a false "busy" costs at most one tick, a false
+# "idle" would kill an in-flight background task AND the new worker session.
+EGPU_BUSY_SYSFS = "/sys/class/drm/card1/device/gpu_busy_percent"  # card1 = eGPU (card2 = iGPU, NOT gated — persistent ~92% baseline)
+EGPU_BUSY_BLOCK_PCT_DEFAULT = 10   # windowed avg >= 10% -> busy -> block launches
+EGPU_BUSY_RESUME_PCT_DEFAULT = 5   # windowed avg < 5% -> idle -> allow launches
+EGPU_BUSY_WINDOW_SAMPLES_DEFAULT = 5
+EGPU_BUSY_SAMPLE_INTERVAL_S_DEFAULT = 2
+
 # Markers embedded in the worker prompts (provenance only — pi rewrites its
 # process title at startup, so they are NOT usable for process detection).
 # The marker in the entry prompt also assigns the worker's ROLE: the agent
 # never infers its role from board state (see tasks-board "Role dispatch").
 WORKER_MARKER = "board-worker-v1"        # implementer
 REVIEWER_MARKER = "board-reviewer-v1"    # reviewer
+REFINER_MARKER = "board-refiner-v1"      # refiner
 
 
 def implementer_entry_prompt(lane, card):
@@ -67,9 +90,12 @@ def implementer_entry_prompt(lane, card):
 
     The card is already in its target lane: Ready triggers are pulled into
     `Active` by the orchestrator at launch time (pre-launch pull), so the
-    worker never selects from `Ready`. The OnHold exception stays worker-side:
-    the condition-cleared check needs judgment (reading the card's Log), which
-    the orchestrator cannot do — the worker claims with `tmd claim`.
+    worker never selects from `Ready`. OnHold triggers with a satisfied
+    canonical condition are pulled the same way (OnHold → Active). The OnHold
+    scan exception stays worker-side for NON-canonical conditions (legacy
+    prose, external conditions like "gitea reachable"): the condition-cleared
+    check needs judgment (reading the card's Log), which the orchestrator
+    cannot do — the worker claims with `tmd claim`.
     """
     if lane == "OnHold":
         task = ("scan the OnHold lane top→bottom, find the first card whose "
@@ -100,11 +126,43 @@ def reviewer_entry_prompt(card):
             "card, then end the session. Review exactly one card per "
             "session.")
 
-# Per-mode worker model (V1: both None = pi default, one shared eGPU slot).
+
+def refiner_entry_prompt(card):
+    """Card-specific refiner prompt (built at launch).
+
+    The refiner works IN PLACE in the Spec lane — the card never moves before
+    the worker boots (no pre-launch pull). It refines the card per the
+    canonical template, parks it in AskUser with a refinement section if there
+    are open points, or marks it refined (AskUser) when done.
+    """
+    return (f"[{REFINER_MARKER}] You are a board refiner. Read "
+            ".pi/skills/tasks-board/SKILL.md and follow it: refine card "
+            f"`Spec/{card}` in place per the canonical template, park it in "
+            "AskUser with a refinement section if there are open points, or "
+            "mark it refined (AskUser) when done; one card per session.")
+
+# Per-mode worker model (V1: all None = pi default, one shared eGPU slot).
 # When set, the worker is launched with `--model <pattern>` (pi CLI flag;
 # supports "provider/id"). V2 (future iGPU): review = "igpu-..." + a 2nd
 # independent single-slot queue (see README).
-WORKER_MODEL = {"implement": None, "review": None}
+# Model precedence at launch: card `## LLM` section > per-mode WORKER_MODEL
+# > pi default (no --model flag).
+WORKER_MODEL = {"implement": None, "review": None, "refine": None}
+
+# Known-models allowlist for the card's `## LLM` section (union of the two
+# llama-server presets llamacpp/models-egpu-rdna.ini +
+# llamacpp/models-igpu.ini; verified live 08.11.2026). Bare model IDs — no
+# provider prefix (`://` breaks the `provider/id` split in `--model`); the
+# `egpu-`/`igpu-` prefix encodes the server and the IDs are globally unique.
+# The card-facing copy of this vocabulary lives in the canonical card
+# template's "known models" appendix
+# (.pi/skills/tasks-board/card-template.md) — keep the two in sync.
+KNOWN_MODELS = frozenset({
+    "egpu-SWIFT-1.5",            # pi default (no `## LLM` section needed)
+    "egpu-SWIFT-1.5-Uncensored",  # uncensored Swift 1.5 eGPU (pentesting)
+    "igpu-Gemma4-26B-A4B",       # iGPU (V2 concern — v1 is eGPU-only)
+    "igpu-Qwen3.6-35B-A3B",      # iGPU (V2 concern — v1 is eGPU-only)
+})
 
 # --------------------------------------------------------------------------
 # Paths
@@ -205,7 +263,19 @@ def review_on_disk(resource):
 def _card_tags(content):
     """Tags on a card's first line, e.g. ['review-by-ai', 'genai_stack']."""
     first_line = content.split("\n", 1)[0]
-    return re.findall(r"\[tag:([^\]]+)\]", first_line)
+    tags = []
+    for group in re.findall(r"\[tag:([^\]]+)\]", first_line):
+        # Lenient: split comma-joined groups (legacy `[tag:a,b]` corruption)
+        # so a malformed card is still recognized instead of stalling the
+        # review loop silently (the 29.10.2026 11-min stall). Loud: log an
+        # anomaly when a comma-joined group is detected.
+        parts = [p.strip() for p in group.split(",")]
+        if len(parts) > 1:
+            log("anomaly: comma-joined tag group %r on a card line 1 — "
+                "normalized to %s (legacy corruption; fix with `tmd tag`)",
+                group, parts)
+        tags.extend(p for p in parts if p)
+    return tags
 
 
 def review_tags(resource):
@@ -230,6 +300,202 @@ def first_review_tagged(resource):
     return None
 
 
+def spec_on_disk(resource):
+    """Card names physically present in the Spec lane (file truth).
+
+    Same rationale as active_on_disk(): the file tree is authoritative for
+    lane membership; sort.json can transiently miss entries.
+    """
+    return {f.get("name") for f in _lane_files(resource, "Spec")}
+
+
+def first_spec_unrefined(resource):
+    """First Spec card (top→bottom) WITHOUT the refined tag. None if none.
+
+    Position = priority (exactly like Review). A card already tagged `refined`
+    (refinement done, awaiting the human's Ready/Backlog decision) is skipped,
+    not a blocker — the hot-loop guard (G5).
+    """
+    for f in _lane_files(resource, "Spec"):
+        if "refined" not in _card_tags(f.get("content", "")):
+            return f.get("name")
+    return None
+
+
+# Canonical OnHold chain condition (tasks-board skill, "OnHold chain
+# condition"): the predecessor card has the `ai-reviewed` tag AND is in the
+# Review or Done lane. A card states it in its `## OnHold condition` section
+# as a `Condition:` line naming the predecessor in quotes. Backticks and the
+# bold markers are optional (the skill's template wraps the literals, real
+# cards often don't).
+_CANONICAL_ONHOLD_CONDITION = re.compile(
+    r'(?m)^\s*\*{0,2}Condition:\*{0,2}\s+the\s+"(?P<card>[^"]+)"\s+card\s+'
+    r'has\s+the\s+`?ai-reviewed`?\s+tag\s+AND\s+is\s+in\s+the\s+`?Review`?\s+'
+    r'or\s+`?Done`?\s+lane\.')
+
+
+def _onhold_condition_section(content):
+    """Text of the card's `## OnHold condition` section (any heading suffix),
+    up to the next `## ` heading or end of card. None if the section is absent.
+
+    Legacy cards use suffixed headings (`## OnHold condition (mechanically
+    checkable — ALL must be true)`) with numbered external conditions — those
+    sections contain no canonical `Condition:` line, so matching the suffix is
+    harmless.
+    """
+    m = re.search(r'(?m)^## OnHold condition[^\n]*\n(.*?)(?=^## |\Z)',
+                  content, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _card_llm_model(content):
+    """Model ID from the card's `## LLM` section (`- Model: <model-id>` line).
+
+    None if the section or the line is absent (the common case — the pi
+    default applies). The returned ID is NOT validated here; the caller
+    validates it against KNOWN_MODELS (invalid -> pi default + anomaly log).
+    """
+    m = re.search(r'(?m)^## LLM[^\n]*\n(.*?)(?=^## |\Z)', content, re.DOTALL)
+    if not m:
+        return None
+    lm = re.search(r'(?m)^\s*-\s*Model:\s*`?([^`\s]+)`?', m.group(1))
+    return lm.group(1) if lm else None
+
+
+def _card_repo_name(content):
+    """Repo name from the card's `## Repo` section (`- Name: <name>` line).
+
+    None if the section or the line is absent (the common case — the worker
+    runs from STACK_ROOT). The returned name is NOT validated here; the
+    caller validates it (path separators / missing checkout -> fallback +
+    anomaly log).
+    """
+    m = re.search(r'(?m)^## Repo[^\n]*\n(.*?)(?=^## |\Z)', content, re.DOTALL)
+    if not m:
+        return None
+    nm = re.search(r'(?m)^\s*-\s*Name:\s*`?([^`\s]+)`?', m.group(1))
+    return nm.group(1) if nm else None
+
+
+def _resolve_card_model(resource, card):
+    """Validated model ID for a trigger card's `## LLM` section, or None.
+
+    None = the pi default applies (section absent — the common case — or the
+    ID is not in KNOWN_MODELS, which also logs an anomaly). The launch never
+    fails on model choice. `resource` is the board file tree (already fetched
+    in tick) — no extra HTTP.
+    """
+    if resource is None:
+        return None
+    content = ""
+    for lane_obj in resource:
+        for f in lane_obj.get("files", []):
+            if f.get("name") == card:
+                content = f.get("content", "")
+                break
+    model = _card_llm_model(content)
+    if model is None:
+        return None
+    if model not in KNOWN_MODELS:
+        log("anomaly: card %r `## LLM` model %r not in the known-models "
+            "allowlist %s — falling back to the pi default (launch not "
+            "failed)", card, model, sorted(KNOWN_MODELS))
+        return None
+    return model
+
+
+def _resolve_worker_cwd(resource, card):
+    """Launch cwd for a trigger card's `## Repo` section, or STACK_ROOT.
+
+    STACK_ROOT = today's behavior (section absent — the common case — or the
+    name is unusable, which also logs an anomaly). The launch never fails on
+    cwd resolution (same philosophy as `## LLM` model choice). `resource` is
+    the board file tree (already fetched in tick) — no extra HTTP.
+
+    Rules:
+    - `## Repo` present, `Name` is a plain directory name (no path
+      separators), and `work/orchestrator/<name>` exists -> that checkout
+      (the session lands in the repo's own Hindsight bank,
+      `coding-agent::<name>`).
+    - `Name` equals the stack repo's own basename -> STACK_ROOT (the live
+      stack root IS that repo's checkout; the work-folder copy is a second
+      clone — editing it would edit the wrong tree).
+    - Otherwise (no `## Repo`, missing checkout, invalid name) -> STACK_ROOT
+      (anomaly logged when `## Repo` is present but unusable).
+    """
+    if resource is None:
+        return STACK_ROOT
+    content = ""
+    for lane_obj in resource:
+        for f in lane_obj.get("files", []):
+            if f.get("name") == card:
+                content = f.get("content", "")
+                break
+    name = _card_repo_name(content)
+    if name is None:
+        return STACK_ROOT
+    if name == os.path.basename(STACK_ROOT):
+        return STACK_ROOT
+    if "/" in name or "\\" in name:
+        log("anomaly: card %r `## Repo` name %r contains a path separator — "
+            "falling back to the stack root cwd (launch not failed)",
+            card, name)
+        return STACK_ROOT
+    checkout = os.path.join(STACK_ROOT, "work", "orchestrator", name)
+    if not os.path.isdir(checkout):
+        log("anomaly: card %r `## Repo` checkout %s missing — falling back "
+            "to the stack root cwd (launch not failed; first-run exception — "
+            "this session's work lands in the stack bank)",
+            card, checkout)
+        return STACK_ROOT
+    return checkout
+
+
+def onhold_precheck(onhold, resource):
+    """Cheap pre-check over the OnHold lane before launching a scan worker.
+
+    Returns the OnHold trigger for evaluate_launch():
+    - ("OnHold", card): launch a scan worker (worker-side judgment) — at
+      least one card's condition is NOT in the canonical tag-based form
+      (legacy prose, external conditions like "gitea reachable") and no
+      canonical condition is satisfied.
+    - ("Active", card): a canonical condition IS satisfied (the predecessor's
+      line 1 has `ai-reviewed` and its lane is Review or Done) — the
+      orchestrator pulls the card OnHold → Active itself (pre-launch pull,
+      like Ready) and the worker works it as a normal Active card. No scan
+      worker.
+    - None: every card's condition is canonical and none is satisfied —
+      skip the launch this tick (the scan hot-loop guard).
+
+    The pre-check is an optimization, not a gate: it recognizes only the
+    canonical tag-based form; everything else falls through to a worker scan.
+    `resource` is the board file tree (already fetched in tick) — no extra
+    HTTP. A predecessor missing from the board is mechanically unsatisfied
+    (canonical, not satisfied) — the card waits for a human fix, no hot loop.
+    """
+    if not onhold:
+        return None
+    board = {}
+    for lane_obj in resource:
+        for f in lane_obj.get("files", []):
+            board[f.get("name")] = (lane_obj.get("name"), f.get("content", ""))
+    non_canonical = False
+    for card in onhold:
+        content = board.get(card, (None, ""))[1]
+        section = _onhold_condition_section(content)
+        m = _CANONICAL_ONHOLD_CONDITION.search(section) if section else None
+        if not m:
+            non_canonical = True
+            continue
+        pred_lane, pred_content = board.get(m.group("card"), (None, ""))
+        if pred_lane in ("Review", "Done") \
+                and "ai-reviewed" in _card_tags(pred_content):
+            return ("Active", card)
+    if non_canonical:
+        return ("OnHold", onhold[0])
+    return None
+
+
 def egpu_up():
     """Probe the eGPU llama-server (GET /v1/models)."""
     try:
@@ -237,6 +503,52 @@ def egpu_up():
         return True
     except Exception:
         return False
+
+
+def _egpu_busy_env(name, default):
+    """Read an EGPU_BUSY_* env-var tunable (per call — operator changes take
+    effect without an orchestrator restart); missing/invalid -> default."""
+    try:
+        return int(os.environ.get(name))
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_gpu_busy():
+    """One read of card1 gpu_busy_percent (int 0-100); None on read failure."""
+    try:
+        with open(EGPU_BUSY_SYSFS) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def egpu_busy_avg():
+    """Windowed average of eGPU GPU-core utilization (card1 = RX 7900 XT).
+
+    Takes EGPU_BUSY_WINDOW_SAMPLES (default 5) reads of
+    /sys/class/drm/card1/device/gpu_busy_percent, EGPU_BUSY_SAMPLE_INTERVAL_S
+    (default 2) seconds apart — a 10 s windowed average. Called only when a
+    launch is being evaluated (no sampling cost on idle ticks). The caller
+    applies the hysteresis thresholds (EGPU_BUSY_BLOCK_PCT / RESUME_PCT).
+
+    Returns the integer average, or None on any read failure (the caller
+    fails closed — an unknown state must not permit a launch).
+    """
+    n = _egpu_busy_env("EGPU_BUSY_WINDOW_SAMPLES", EGPU_BUSY_WINDOW_SAMPLES_DEFAULT)
+    if n < 1:
+        n = EGPU_BUSY_WINDOW_SAMPLES_DEFAULT
+    interval = _egpu_busy_env("EGPU_BUSY_SAMPLE_INTERVAL_S",
+                              EGPU_BUSY_SAMPLE_INTERVAL_S_DEFAULT)
+    samples = []
+    for i in range(n):
+        v = _read_gpu_busy()
+        if v is None:
+            return None
+        samples.append(v)
+        if i < n - 1:
+            time.sleep(interval)
+    return sum(samples) // len(samples)
 
 
 # --------------------------------------------------------------------------
@@ -329,8 +641,10 @@ def empty_state():
         "last_launch_at": None,
         "board_down": False,
         "egpu_down": False,
+        "egpu_busy": False,
         "idle_no_work": False,
         "cooldown_announced": False,
+        "onhold_blocked_announced": False,
         "dead_board_down_announced": False,
     }
 
@@ -360,7 +674,18 @@ def save_state(state):
 # --------------------------------------------------------------------------
 # Worker lifecycle
 # --------------------------------------------------------------------------
-def launch_worker(state, now, trigger):
+def launch_worker(state, now, trigger, card_model=None, worker_cwd=None):
+    """Launch the worker for a trigger. `card_model` is the validated model ID
+    from the trigger card's `## LLM` section (None = section absent or its ID
+    failed validation — see _resolve_card_model). Model precedence: card
+    `## LLM` > per-mode WORKER_MODEL > pi default (no --model flag).
+    `worker_cwd` is the resolved launch cwd from the trigger card's
+    `## Repo` section (None = no `## Repo` or it is unusable — see
+    _resolve_worker_cwd). When it differs from STACK_ROOT the launch gains
+    `--skill <STACK_ROOT>/.pi/skills` (the board skills are project skills of
+    the stack root; a checkout has no `.pi`) + `--approve` (explicit
+    project-trust decision for the automated run), and the entry prompt notes
+    the checkout cwd (the worker's repo-setup step operates on `.`)."""
     os.makedirs(SESSION_LOG_DIR, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     log_file = os.path.join(SESSION_LOG_DIR, f"session-{ts}.log")
@@ -369,20 +694,33 @@ def launch_worker(state, now, trigger):
         log_file = os.path.join(SESSION_LOG_DIR, f"session-{ts}-{n}.log")
         n += 1
     lane, card = trigger
-    mode = "review" if lane == "Review" else "implement"
-    model = WORKER_MODEL.get(mode)
+    mode = "review" if lane == "Review" else (
+        "refine" if lane == "Spec" else "implement")
+    model = card_model or WORKER_MODEL.get(mode)
+    cwd = worker_cwd if worker_cwd is not None else STACK_ROOT
+    repo_cwd = cwd != STACK_ROOT
     if mode == "review":
         entry_prompt = reviewer_entry_prompt(card)
+    elif mode == "refine":
+        entry_prompt = refiner_entry_prompt(card)
     else:
         entry_prompt = implementer_entry_prompt(lane, card)
+    if repo_cwd:
+        entry_prompt += (f" Note: the session cwd is the repo checkout "
+                         f"`{cwd}` (the card's `## Repo` target) — your "
+                         f"repo-setup step operates on `.` there; do not "
+                         f"clone into a subpath.")
     cmd = [PI_BIN, "-p", entry_prompt]
     if model:
         cmd += ["--model", model]
+    if repo_cwd:
+        cmd += ["--skill", os.path.join(STACK_ROOT, ".pi", "skills"),
+                "--approve"]
     env = os.environ.copy()
     with open(log_file, "wb") as lf:
         proc = subprocess.Popen(
             cmd,
-            cwd=STACK_ROOT,
+            cwd=cwd,
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
@@ -392,7 +730,7 @@ def launch_worker(state, now, trigger):
     state["slot"] = {
         "pid": proc.pid,
         "card": card,               # seeded from the trigger; refined on ticks
-        "mode": mode,               # "implement" | "review"
+        "mode": mode,               # "implement" | "review" | "refine"
         "start_time": pid_start_time(proc.pid),
         "card_seen_active": False,  # set once the card is observed in the mode lane
         "started_at": now,
@@ -402,8 +740,8 @@ def launch_worker(state, now, trigger):
     state["last_launch_at"] = now
     state["cooldown_announced"] = False
     save_state(state)
-    log("launch: pid=%d trigger=%s/%s mode=%s model=%s log=%s",
-        proc.pid, lane, card, mode, model or "pi-default",
+    log("launch: pid=%d trigger=%s/%s mode=%s model=%s cwd=%s log=%s",
+        proc.pid, lane, card, mode, model or "pi-default", cwd,
         os.path.relpath(log_file, ORCH_DIR))
 
 
@@ -440,16 +778,18 @@ def watch_worker(state, now, mode_lane, review_tagged=None):
     """Liveness + timers for the current worker.
 
     `mode_lane` = ordered card list for the slot's mode lane (Active for
-    implement, Review for review), or None when the board is down
-    (board-dependent checks are deferred). `review_tagged` = set of Review
-    cards currently tagged review-by-ai (reviewer mode only; None otherwise).
+    implement, Review for review, Spec for refine), or None when the board is
+    down (board-dependent checks are deferred). `review_tagged` = set of
+    Review cards currently tagged review-by-ai (reviewer mode only; None
+    otherwise).
     """
     slot = state["slot"]
     if slot is None:
         return
     pid = slot["pid"]
     mode = slot.get("mode", "implement")
-    lane_name = "Review" if mode == "review" else "Active"
+    lane_name = ("Review" if mode == "review"
+                 else "Spec" if mode == "refine" else "Active")
 
     if not worker_identity_ok(slot):
         if mode_lane is None:
@@ -480,7 +820,8 @@ def watch_worker(state, now, mode_lane, review_tagged=None):
         card = slot["card"]
         if card in mode_lane:
             slot["card_seen_active"] = True
-        elif len(mode_lane) == 1 and mode_lane[0] != card:
+        elif len(mode_lane) == 1 and mode_lane[0] != card \
+                and not slot["card_seen_active"]:
             slot["card"] = mode_lane[0]
             card = mode_lane[0]
             slot["card_seen_active"] = True
@@ -506,10 +847,10 @@ def watch_worker(state, now, mode_lane, review_tagged=None):
                             EXIT_TIMER_SECONDS, card)
                     save_state(state)
             elif seen and not in_lane:
-                # Implementer (unchanged): card left Active.
+                # Implementer / refiner: card left its mode lane (Active/Spec).
                 slot["exit_timer_armed_at"] = now
-                log("timer: exit timer armed (%ds) — card %r left Active",
-                    EXIT_TIMER_SECONDS, card)
+                log("timer: exit timer armed (%ds) — card %r left %s",
+                    EXIT_TIMER_SECONDS, card, lane_name)
                 save_state(state)
             # Grace-ended backstop (both modes): never seen in the mode lane
             # and the lane is now empty.
@@ -527,20 +868,38 @@ def watch_worker(state, now, mode_lane, review_tagged=None):
         kill_worker(state, "exit timer expired")
 
 
-def evaluate_launch(state, now, active, onhold, ready, review_trigger=None):
-    """Launch evaluation: eGPU probe -> trigger -> cooldown -> launch.
+def evaluate_launch(state, now, active, onhold, ready, review_trigger=None,
+                    spec_trigger=None, onhold_trigger=None, resource=None):
+    """Launch evaluation: eGPU probe -> trigger -> eGPU busy gate -> cooldown -> launch.
 
-    Queue order: Active → Ready → OnHold → Review. `review_trigger` is the
-    first Review card (top→bottom) tagged review-by-ai, or None (computed in
-    tick from the board resource). Reviews never preempt in-flight (Active),
-    fresh (Ready) or unblocking (OnHold) work.
+    `resource` is the board file tree (already fetched in tick) — used to
+    resolve the trigger card's `## LLM` model (validated against
+    KNOWN_MODELS; absent/invalid -> pi default, the launch never fails)
+    and its `## Repo` launch cwd (checkout present -> that checkout; absent
+    / invalid -> STACK_ROOT, the launch never fails).
+
+    Queue order: Active → Spec → Review → Ready → OnHold. `spec_trigger` is
+    the first Spec card (top→bottom) WITHOUT the refined tag, or None
+    (computed in tick from the board resource). `review_trigger` is the first
+    Review card (top→bottom) tagged review-by-ai, or None. `onhold_trigger`
+    is the OnHold pre-check's decision (computed in tick from the board
+    resource, see onhold_precheck()): ("OnHold", card) = launch a scan worker
+    (worker-side judgment — at least one non-canonical condition),
+    ("Active", card) = a canonical tag-based condition is satisfied (the
+    orchestrator pulls the card OnHold → Active itself, see the pre-launch
+    pull below), None = no OnHold trigger (lane empty, or every condition
+    canonical and unsatisfied — the scan hot-loop guard). Only in-flight
+    (Active) work takes precedence over everything; Spec (refinement)
+    preempts Review/Ready/OnHold.
 
     Pre-launch pull: a Ready trigger is moved into Active by the orchestrator
     itself (board_move_card, plain HTTP ~ms) before launch_worker — the card
     is in its target lane before the worker boots. On failure: anomaly logged,
-    launch skipped, retried next tick. OnHold triggers are NOT pulled (the
-    condition-cleared check is worker-side judgment; the worker claims with
-    `tmd claim`).
+    launch skipped, retried next tick. An OnHold trigger with a satisfied
+    canonical condition is pulled the same way (OnHold → Active); the
+    worker-side claim (`tmd claim`) remains the fallback for non-canonical
+    conditions (the scan worker). Spec triggers are NOT pulled (the refiner
+    works in place in Spec — the card never moves before the worker boots).
     """
     if not egpu_up():
         if not state.get("egpu_down"):
@@ -554,19 +913,62 @@ def evaluate_launch(state, now, active, onhold, ready, review_trigger=None):
 
     if active:
         trigger, cooldown = ("Active", active[0]), COOLDOWN_NORMAL_SECONDS
-    elif ready:
-        trigger, cooldown = ("Ready", ready[0]), COOLDOWN_NORMAL_SECONDS
-    elif onhold:
-        trigger, cooldown = ("OnHold", onhold[0]), COOLDOWN_ONHOLD_ONLY_SECONDS
+    elif spec_trigger:
+        trigger, cooldown = ("Spec", spec_trigger), COOLDOWN_NORMAL_SECONDS
     elif review_trigger:
         trigger, cooldown = ("Review", review_trigger), COOLDOWN_NORMAL_SECONDS
+    elif ready:
+        trigger, cooldown = ("Ready", ready[0]), COOLDOWN_NORMAL_SECONDS
+    elif onhold_trigger:
+        trigger, cooldown = onhold_trigger, COOLDOWN_ONHOLD_ONLY_SECONDS
     else:
-        if not state.get("idle_no_work"):
-            log("idle: no workable cards (Active/Ready/OnHold/Review empty)")
+        if onhold:
+            # OnHold pre-check: every card's condition is in the canonical
+            # tag-based form and none is satisfied — no scan worker (the
+            # hot-loop guard). Log once, in the style of the idle/cooldown
+            # announcements.
+            if not state.get("onhold_blocked_announced"):
+                log("idle: OnHold pre-check — %d card(s), all canonical "
+                    "conditions unsatisfied — no scan worker", len(onhold))
+                state["onhold_blocked_announced"] = True
+        elif not state.get("idle_no_work"):
+            log("idle: no workable cards (Active/Review/Ready/OnHold empty)")
         state["idle_no_work"] = True
         save_state(state)
         return
     state["idle_no_work"] = False
+    state["onhold_blocked_announced"] = False
+
+    # eGPU busy gate (complements the cooldown: the cooldown handles fast
+    # crash loops, this handles long compute occupation). A worker whose
+    # session died while a background task still owns the eGPU must not be
+    # re-launched — the restart would disturb the eGPU compute and kill the
+    # new session too. 10 s windowed average, taken only now that a trigger
+    # was selected (no sampling cost on idle ticks). Hysteresis: avg >=
+    # BLOCK_PCT -> busy, avg < RESUME_PCT -> idle, in between the state keeps
+    # its value. Read failure -> fail closed (busy). Busy mirrors egpu_down:
+    # log once on transition, return before the cooldown check -> no launch,
+    # last_exit_at/cooldown_announced untouched (no cooldown reset), retry
+    # next tick.
+    avg = egpu_busy_avg()
+    if avg is None:
+        if not state.get("egpu_busy"):
+            log("anomaly: eGPU busy read failed — treating as busy, no launches")
+        state["egpu_busy"] = True
+        save_state(state)
+        return
+    if state.get("egpu_busy"):
+        if avg < _egpu_busy_env("EGPU_BUSY_RESUME_PCT", EGPU_BUSY_RESUME_PCT_DEFAULT):
+            log("idle: eGPU back to idle (%d%%)", avg)
+            state["egpu_busy"] = False
+            save_state(state)
+    else:
+        if avg >= _egpu_busy_env("EGPU_BUSY_BLOCK_PCT", EGPU_BUSY_BLOCK_PCT_DEFAULT):
+            log("idle: eGPU busy (%d%%) — no launches", avg)
+            state["egpu_busy"] = True
+            save_state(state)
+    if state.get("egpu_busy"):
+        return  # skip this tick: no launch, no cooldown reset; retry next tick
 
     last_exit = state.get("last_exit_at")
     if last_exit is not None and now - last_exit < cooldown:
@@ -577,13 +979,14 @@ def evaluate_launch(state, now, active, onhold, ready, review_trigger=None):
             save_state(state)
         return
 
-    # Pre-launch pull (Ready → Active): the move is plain HTTP (~ms, no
-    # container, no LLM) — the card is in Active before the worker boots, so
-    # card_seen_active is true from the first tick and the "no card ever in
-    # Active" backstop cannot mis-fire for a launched worker. Active is empty
-    # by construction (Ready is only reached when the Active trigger is
-    # absent). On failure (user moved the card in the UI between read and
-    # write): log anomaly, skip this launch, retry next tick.
+    # Pre-launch pull (Ready → Active, OnHold → Active): the move is plain
+    # HTTP (~ms, no container, no LLM) — the card is in Active before the
+    # worker boots, so card_seen_active is true from the first tick and the
+    # "no card ever in Active" backstop cannot mis-fire for a launched
+    # worker. Active is empty by construction (these triggers are only
+    # reached when the Active trigger is absent). On failure (user moved the
+    # card in the UI between read and write): log anomaly, skip this launch,
+    # retry next tick.
     if trigger[0] == "Ready":
         try:
             board_move_card(trigger[1], "Ready", "Active")
@@ -594,8 +997,24 @@ def evaluate_launch(state, now, active, onhold, ready, review_trigger=None):
                 "skipping launch this tick",
                 trigger[1], type(e).__name__, e)
             return
+    elif trigger[0] == "Active" and not active:
+        # OnHold pre-check: a canonical tag-based condition is satisfied —
+        # the orchestrator claims the card itself (mechanical, no worker
+        # judgment), mirroring the Ready pull. The Active list is empty by
+        # construction, so an ("Active", card) trigger here always comes from
+        # the OnHold pre-check.
+        try:
+            board_move_card(trigger[1], "OnHold", "Active")
+            log("pull: %s -> Active at launch (OnHold canonical condition "
+                "satisfied, pre-worker move)", trigger[1])
+        except Exception as e:
+            log("anomaly: OnHold pre-launch pull %s -> Active failed (%s: %s) — "
+                "skipping launch this tick",
+                trigger[1], type(e).__name__, e)
+            return
 
-    launch_worker(state, now, trigger)
+    launch_worker(state, now, trigger, _resolve_card_model(resource, trigger[1]),
+                  _resolve_worker_cwd(resource, trigger[1]))
 
 
 def tick(state, stopping):
@@ -619,6 +1038,7 @@ def tick(state, stopping):
     onhold = list(sort.get("OnHold") or [])
     ready = list(sort.get("Ready") or [])
     review = list(sort.get("Review") or [])
+    spec = list(sort.get("Spec") or [])
 
     # Full board tree (file truth + tags), fetched once per tick.
     resource = None
@@ -667,14 +1087,45 @@ def tick(state, stopping):
                 "restored this tick (file truth authoritative)", missing)
             review.extend(missing)
 
+    # Cross-check the Spec lane against file truth (same two-way gap; refiner
+    # mode — the refiner works in place in Spec).
+    if resource is not None:
+        spec_disk = spec_on_disk(resource)
+        stale = [c for c in spec if c not in spec_disk]
+        if stale:
+            log("anomaly: sort lists %s in Spec but file(s) absent on disk — "
+                "ignored this tick", stale)
+            spec = [c for c in spec if c in spec_disk]
+        missing = [c for c in spec_disk if c not in spec]
+        if missing:
+            log("anomaly: file(s) %s in Spec on disk but absent from sort — "
+                "restored this tick (file truth authoritative)", missing)
+            spec.extend(missing)
+
     # Review trigger: first Review card (top→bottom) tagged review-by-ai.
     review_trigger = first_review_tagged(resource) if resource is not None else None
+    # Spec trigger: first Spec card (top→bottom) WITHOUT the refined tag.
+    spec_trigger = first_spec_unrefined(resource) if resource is not None else None
+    # OnHold trigger: cheap pre-check (no worker, no extra HTTP — the
+    # resource is already fetched): canonical tag-based conditions are
+    # mechanically checkable, so the orchestrator decides launch/skip/pull
+    # itself. Resource unavailable -> fall back to a scan worker (the
+    # pre-check is an optimization, not a gate).
+    if resource is not None:
+        onhold_trigger = onhold_precheck(onhold, resource)
+    else:
+        onhold_trigger = ("OnHold", onhold[0]) if onhold else None
 
     # 2. Worker liveness + 3. timers (mode-aware).
     slot = state["slot"]
     if slot is not None:
         mode = slot.get("mode", "implement")
-        mode_lane = review if mode == "review" else active
+        if mode == "review":
+            mode_lane = review
+        elif mode == "refine":
+            mode_lane = spec
+        else:
+            mode_lane = active
         review_tagged = review_tags(resource) if (mode == "review" and resource is not None) else None
     else:
         mode_lane = None
@@ -683,7 +1134,8 @@ def tick(state, stopping):
 
     # 4. Launch evaluation (disabled during graceful stop).
     if state["slot"] is None and not stopping:
-        evaluate_launch(state, now, active, onhold, ready, review_trigger)
+        evaluate_launch(state, now, active, onhold, ready, review_trigger,
+                        spec_trigger, onhold_trigger, resource)
 
 
 # --------------------------------------------------------------------------

@@ -11,12 +11,14 @@ Covers:
      ("Active", card) — the card is in Active before the worker boots.
   2. Pull failure   -> anomaly logged, NO launch (retried next tick).
   3. Active trigger -> no pull (card already in Active), card-specific prompt.
-  4. OnHold trigger -> no pull (condition check is worker-side judgment),
+  4. OnHold trigger (scan worker, non-canonical fallback) -> no pull,
      OnHold prompt instructs `tmd claim`.
-  5. Review trigger -> reviewer prompt names the card.
-  6. Cooldown       -> no pull, no launch (cooldown gate intact).
-  7. eGPU down      -> no pull, no launch.
-  8. Prompt builders (pure functions): implementer Active/OnHold, reviewer.
+  5. Review trigger -> reviewer prompt names the card, no pull.
+  6. Queue order    -> Review triggers before Ready and OnHold; a Review
+     trigger never pulls (the pull applies only to Ready triggers).
+  7. Cooldown       -> no pull, no launch (cooldown gate intact).
+  8. eGPU down      -> no pull, no launch.
+  9. Prompt builders (pure functions): implementer Active/OnHold, reviewer.
 
 Run:  python3 orchestrator/test_prelaunch_pull_dryrun.py
 """
@@ -38,7 +40,8 @@ def check(name, cond, detail=""):
 
 
 def _run_evaluate(active=(), onhold=(), ready=(), review_trigger=None,
-                  pull_raises=False, egpu=True, last_exit_at=None):
+                  onhold_trigger=None, pull_raises=False, egpu=True,
+                  last_exit_at=None):
     """Run one evaluate_launch() with everything monkeypatched.
 
     Returns (state, log_lines, pull_attempts, pulls, launches) where pulls is
@@ -57,7 +60,10 @@ def _run_evaluate(active=(), onhold=(), ready=(), review_trigger=None,
 
     o.board_move_card = fake_pull
     o.egpu_up = lambda: egpu
-    o.launch_worker = lambda state, now, trigger: launches.append(trigger)
+    orig_busy_avg = o.egpu_busy_avg
+    o.egpu_busy_avg = lambda: 0  # idle eGPU — no real sysfs reads/sleeps
+    o.launch_worker = (lambda state, now, trigger, card_model=None, worker_cwd=None:
+                       launches.append(trigger))
     o.save_state = lambda state: None
     orig_log = o.log
     o.log = lambda msg, *args: log_lines.append(msg % args if args else msg)
@@ -67,9 +73,10 @@ def _run_evaluate(active=(), onhold=(), ready=(), review_trigger=None,
     now = 2_000_000.0
     try:
         o.evaluate_launch(state, now, list(active), list(onhold),
-                          list(ready), review_trigger)
+                          list(ready), review_trigger, None, onhold_trigger)
     finally:
         o.log = orig_log
+        o.egpu_busy_avg = orig_busy_avg
     return state, log_lines, attempts[0], pulls, launches
 
 
@@ -109,8 +116,9 @@ def test_active_trigger_no_pull():
 
 
 def test_onhold_trigger_no_pull():
-    print("4. OnHold trigger — no pull (condition check is worker-side)")
-    _, log_lines, attempts, pulls, launches = _run_evaluate(onhold=["onhold-card"])
+    print("4. OnHold scan trigger — no pull (worker-side judgment fallback)")
+    _, log_lines, attempts, pulls, launches = _run_evaluate(
+        onhold=["onhold-card"], onhold_trigger=("OnHold", "onhold-card"))
     check("no pull", attempts == 0 and pulls == [],
           f"attempts={attempts} pulls={pulls}")
     check("launch with OnHold trigger",
@@ -127,8 +135,25 @@ def test_review_trigger():
           launches == [("Review", "rev-card")], f"launches={launches}")
 
 
+def test_review_preempts_ready_and_onhold():
+    print("6. Queue order — Review triggers before Ready and OnHold, never pulls")
+    _, log_lines, attempts, pulls, launches = _run_evaluate(
+        ready=["ready-card"], review_trigger="rev-card")
+    check("Review preempts Ready",
+          launches == [("Review", "rev-card")], f"launches={launches}")
+    check("no pull for a Review trigger (Ready present)",
+          attempts == 0 and pulls == [], f"attempts={attempts} pulls={pulls}")
+    _, log_lines, attempts, pulls, launches = _run_evaluate(
+        onhold=["onhold-card"], review_trigger="rev-card",
+        onhold_trigger=("OnHold", "onhold-card"))
+    check("Review preempts OnHold",
+          launches == [("Review", "rev-card")], f"launches={launches}")
+    check("no pull for a Review trigger (OnHold present)",
+          attempts == 0 and pulls == [], f"attempts={attempts} pulls={pulls}")
+
+
 def test_cooldown_still_gates():
-    print("6. Cooldown — no pull, no launch while in cooldown")
+    print("7. Cooldown — no pull, no launch while in cooldown")
     _, log_lines, attempts, pulls, launches = _run_evaluate(
         ready=["ready-card"], last_exit_at=2_000_000.0 - 10)  # 10 s ago < 60 s
     check("no pull (cooldown before pull)", attempts == 0 and pulls == [],
@@ -139,7 +164,7 @@ def test_cooldown_still_gates():
 
 
 def test_egpu_down_no_pull():
-    print("7. eGPU down — no pull, no launch")
+    print("8. eGPU down — no pull, no launch")
     _, log_lines, attempts, pulls, launches = _run_evaluate(
         ready=["ready-card"], egpu=False)
     check("no pull", attempts == 0 and pulls == [],
@@ -148,7 +173,7 @@ def test_egpu_down_no_pull():
 
 
 def test_prompts():
-    print("8. Prompt builders — card-specific entry prompts")
+    print("9. Prompt builders — card-specific entry prompts")
     p = o.implementer_entry_prompt("Active", "my card")
     check("implementer/Active names the card in Active",
           "work card `Active/my card`" in p and "board-worker-v1" in p, p)
@@ -170,6 +195,7 @@ def main():
         test_active_trigger_no_pull,
         test_onhold_trigger_no_pull,
         test_review_trigger,
+        test_review_preempts_ready_and_onhold,
         test_cooldown_still_gates,
         test_egpu_down_no_pull,
         test_prompts,

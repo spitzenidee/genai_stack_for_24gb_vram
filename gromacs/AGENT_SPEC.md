@@ -3,6 +3,16 @@
 **Status:** FINAL (rev 2026-09-20: scope/path/layering fixes + launcher rule + conformance input) — ready for implementation.
 **Companion docs:** knowledge base `.pi/skills/gromacs-sim/knowledge/` (domain truth), this spec (process + ownership + architecture rationale).
 
+> **Migration note (2026-10-23):** the entry point has migrated from the
+> pi-subagents custom agent to **vanilla pi**. The pi-subagents agent file
+> `.pi/agents/gromacs-md.md` and the `/gromacs-md` prompt template are
+> **deleted**. The persona prompt now lives in `.pi/gromacs-md-system.md`
+> and is launched by `scripts/pi-gromacs` (vanilla `pi` with
+> `--system-prompt .pi/gromacs-md-system.md` + `--thinking high`, iGPU model
+> pinned, `hindsight_*` tools excluded). The D2, §3, §5, and §6 references
+> below describe the **original (pre-migration)** design and are kept for
+> rationale; they no longer reflect the live entry point.
+
 ---
 
 ## 0. Decisions log
@@ -33,6 +43,8 @@ The gromacs-md run is pinned to the iGPU (single-slot). The **launching** sessio
 
 1. **iGPU model (R5): DECIDED — `igpu-Qwen3.6-35B-A3B`** (pinned in frontmatter, 2026-09-20). Both models completed lysozyme phases 0–4 with all gates PASS after a harness fix. Qwen won on scientific judgment: cleaner EM (Fmax 200 via correct D10 CG-fallback vs Gemma's 419 from SD-only), and it independently diagnosed a real `check_em.sh` log-parse bug and explained it precisely — the quality an unattended agent needs. Gemma (26B) is smaller/faster but accepted SD machine-precision without the fallback and mislabeled the gate failure as "standard behavior."
    - *Dry-run note (2026-09-20):* the first dry runs of **both** models appeared to loop on `read` (100+ identical PDB reads, zero `bash`). A control test proved the cause was the agent frontmatter: `tools: inherit` is not a valid value and silently resolved to `read` + `contact_supervisor`, so the agent had **no bash tool** and could only read. Fixed to an explicit allowlist (`bash, read, write, edit, ls, find, grep`). The models were never weak; the loops were tool starvation. Re-ran both dry runs after the fix — both passed.
+   - *Model switch (2026-11-03):* iGPU default moved to `igpu-LFM2.5-24B-A2B` (hindsight `LLAMA_IGPU_MODEL` in `.env` + `scripts/pi-gromacs` pin). The iGPU's `parallel = 2` concurrent-slot design (agent brain + Hindsight background work, no model swap) requires both to share one model, so the pins move together.
+   - *R5 re-run (2026-11-03):* **FAILED — LFM2.5 does not meet the bar; pins reverted to `igpu-Qwen3.6-35B-A3B` (same day).** The dry-run died in phase 1 (prep) before any scientific gate: after a clean phase 0, the agent misapplied the `01-prep.md` `$PWD`-relative docker mount (ran it from the project dir, not the stack root), then spent ~15 min misdiagnosing its own command errors as environment failures ("volume mount isn't resolving", "container filesystem is isolated", "project directories disappeared!") — missing the root-owned auto-created mount dirs visible in its own `ls` output three times — before degenerating into a token-level path-typo loop (`/home/<user>/dogar/…` ×9) it could not escape even after explicit user correction and a fresh `pwd`. It also left a detached non-transient container running. vs Qwen (Fmax 200, found a real `check_em.sh` bug) and Gemma (Fmax 419, mislabeled a gate failure), LFM2.5's failure is operational collapse, not scientific judgment — the worst mode for an unattended agent. Full comparison: board card `Spec/Implement - R5 lysozyme dry-run on igpu-LFM2.5-24B-A2B` → `## Result`.
 
 *Resolved during review:* monitoring model → D12; single entry point → D2; 24 GB VRAM → D14; `thinking: high` is honored by the llama-server runtime (server-side `--reasoning` budgets) → no action; cofactor scope → FF-native cofactors stay in scope (D5 reworded 2026-09-20: "proteins only" was too narrow — nucleic acids and FF-native cofactors need no sidecar); analysis suite → 8-item default is the v1 bar, SASA/Ramachandran/PCA deferred to the v1.1 sidecar (2026-09-20); conformance length → 200 ps production kept (2026-09-20).
 

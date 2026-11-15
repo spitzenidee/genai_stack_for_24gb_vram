@@ -8,7 +8,16 @@ Commands:
   list [project]                 one line per lane, cards in stored order
   get <Lane/card.md>             print card markdown
   new-lane <Lane>                create lane
-  new-card <Lane/card.md>        create card, content from stdin
+  new-card <Lane/card.md>        create card, content from stdin (validates
+                                 the content: structure + Log entries;
+                                 --force overrides for repair)
+                                 --template renders the card from the
+                                 canonical template (card-template.md in
+                                 this skill dir; --tag spec|research sets
+                                 the optional type tag, --actor agent|human)
+  sync-template                  refresh the board mirror card
+                                 (Backlog/TEMPLATE CARD) from the canonical
+                                 template file (preserves the mirror's Log)
   edit <Lane/card.md>            replace content, from stdin (validates the
                                  result: structure + newly-written Log entries;
                                  --force overrides for repair)
@@ -26,6 +35,15 @@ Commands:
                                  whole-Log check)
   append <Lane/card.md>          append stdin to content (validates the
                                  appended Log entries; --force overrides)
+  tag <Lane/card.md> --add <t> [--add ...] --remove <t> [--remove ...]
+                                 edit line-1 tags surgically (line 1 ONLY, no
+                                 full-card rewrite): idempotent (add-existing /
+                                 remove-absent = printed no-ops), self-heals
+                                 comma-joined groups, owns the canonical
+                                 one-group-per-tag format, validates tag names;
+                                 --add accepts FLOW_TAGS only (line 1 is pure
+                                 flow control), --remove any tag (incl. legacy
+                                 project tags)
   move <src> <dst>               move card (dst may be "Lane/" to keep name);
                                  auto-updates sort order on both lanes
   claim <Lane/card.md>           claim a card for work: verify Active is EMPTY
@@ -85,8 +103,47 @@ def req(method, path, body=None, raw_body=None, content_type=None):
 
 
 def q(path):
-    """URL-encode a board path (spaces, '#' etc.; slashes stay)."""
+    """URL-encode a board path (spaces, '#' etc.; slashes stay).
+
+    Gate: every board path (read or write) passes through here RAW, so
+    this is the single choke point for the card-name check. (The body's
+    newPath in a move is raw too — cmd_move checks it explicitly.)
+    """
+    check_board_name(path)
     return urllib.parse.quote(path, safe="/")
+
+
+# The board UI refuses card names containing these (frontend validator
+# /[<>:%"/\\|?*]/g -> red "Forbidden characters" warning). tmd mirrors the
+# same set so agent-created cards are always renamable/editable in the
+# human UI. '%' additionally breaks the server itself (double-decode 500).
+FORBIDDEN_NAME_CHARS = set('<>:"/\\|?*%')
+
+
+def check_board_name(path):
+    """Refuse card names the board rejects (write endpoints).
+
+    Mirrors the board UI's validator (frontend /[<>:%"/\\|?*]/g, red
+    'Forbidden characters' warning) plus the leading-dot rule the UI also
+    enforces ('Hidden by dot'):
+    - '<>:"/\\|?*%': refused by the UI; '%' additionally 500s EVERY
+      update/move server-side (double-decode bug in the pinned tasks.md
+      app's updateResource) and makes the card unmanageable via the API.
+    - leading '.': dotfile, filtered out of the board's resource tree ->
+      ghost card, invisible in UI and API.
+    Everything else round-trips fine (';', '#', '{', '}', umlauts, emoji,
+    ...). GETs are unaffected (single decode).
+    """
+    name = path.rsplit("/", 1)[-1]
+    bad = FORBIDDEN_NAME_CHARS & set(name)
+    if bad:
+        die(f"card name contains forbidden character(s) "
+            f"{''.join(sorted(bad))!r}: {name!r} — the board UI refuses "
+            f"these ('Forbidden characters'); '%' additionally 500s every "
+            f"update/move server-side; choose a name without them")
+    if name.startswith("."):
+        die(f"card name starts with '.': {name!r} — dotfiles are filtered "
+            f"out of the board tree (ghost card, invisible in UI and API)")
 
 
 def proj_suffix(project):
@@ -191,10 +248,117 @@ def cmd_new_lane(name):
     print(f"created lane: {name}")
 
 
-def cmd_new_card(path):
+def default_template_path():
+    """Canonical template location: /tools/card-template.md in container
+    mode (the wrapper mounts it read-only); sibling of this script's skill
+    dir in host mode."""
+    for p in ("/tools/card-template.md",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "card-template.md")):
+        if os.path.isfile(p):
+            return p
+    die("no template file found (expected card-template.md in the "
+        "tasks-board skill dir)")
+
+
+def _tpl_section(lines, heading):
+    """Body lines of the '## <heading>' section (up to the next '## ' heading)."""
+    out, on = [], False
+    for ln in lines:
+        if ln.strip() == f"## {heading}":
+            on = True
+            continue
+        if on and re.match(r"^##\s", ln):
+            break
+        if on:
+            out.append(ln)
+    if not on:
+        die(f"template file: missing '## {heading}' section")
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def _tpl_fenced_body(lines, heading="Template"):
+    """Lines of the first fenced code block after '## <heading>'."""
+    on, in_fence, body = False, False, []
+    for ln in lines:
+        if not on:
+            if ln.strip() == f"## {heading}":
+                on = True
+            continue
+        s = ln.strip()
+        if not in_fence:
+            if s.startswith("```"):
+                in_fence = True
+        elif s.startswith("```"):
+            return body
+        else:
+            body.append(ln)
+    die("template file: no fenced template body found")
+
+
+def render_template(path, title, lane, tag=None, actor="agent"):
+    """Render a new card from the canonical template: substitute the H1
+    title, the Created log line (real timestamp + lane + actor), and
+    optionally the line-1 type tag (line 1 stays empty when no --tag).
+    The `## How to fill this card` instructional section is stripped from
+    the render (it is for the human UI copy-paste path only; the section
+    stays in the fenced template file)."""
+    try:
+        with open(path) as f:
+            body = _tpl_fenced_body(f.read().splitlines())
+    except OSError:
+        die(f"cannot read template file: {path} (in container mode only "
+            f"mounted paths are visible — use the default or "
+            f"/tools/card-template.md)")
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    out = []
+    in_howto = False
+    for ln in body:
+        if in_howto:
+            if ln.startswith("## "):
+                in_howto = False
+            else:
+                continue
+        if ln.startswith("## How to fill this card"):
+            in_howto = True
+            continue
+        if ln.startswith("# "):
+            ln = f"# {title}"
+        elif ln.startswith("- <DD.MM.YYYY HH:MM>"):
+            ln = f"- {now} **Created** — created in `{lane}` ({actor})."
+        out.append(ln)
+    if tag:
+        out[0] = f"[tag:{tag}]"
+    return "\n".join(out) + "\n"
+
+
+def cmd_new_card(path, force=False, template=None, tag=None, actor="agent"):
     path = ensure_md(path)
+    if template:
+        _, lane, card = split_path(path)
+        content = render_template(template, card.removesuffix(".md"), lane,
+                                  tag=tag, actor=actor)
+    else:
+        content = sys.stdin.read()
+    if tag and tag not in TYPE_TAGS:
+        die(f"new-card: --tag takes a type tag only (spec/research) — got {tag!r}")
+    if not force:
+        # A new card's whole content is the newly written delta: validate
+        # structure (P2: tag line, H1, single Log, Log last) + every Log
+        # entry (P3, delta-scoped = the whole card). Same gate as
+        # edit/insert/append, so a malformed line 1 can never be born.
+        violations = validate_card(content)
+        log_lines, log_nums = extract_log_lines(content)
+        if log_lines:
+            violations.extend(validate_log_lines(log_lines, log_nums))
+        if violations:
+            refuse_violations("new-card", path, violations)
     req("POST", "/resource/" + q(path),
-        body={"isFile": True, "content": sys.stdin.read()})
+        body={"isFile": True, "content": content})
     # Register in the sort map — /_api/sort (and the orchestrator) only see
     # cards listed there; a file-only card is a ghost (tmd list merges
     # unsorted on-disk cards, which masks the gap).
@@ -205,7 +369,71 @@ def cmd_new_card(path):
         sort.setdefault(lane, [])
         sort[lane].append(name)
         put_sort(project, sort)
-    print(f"created: {path}")
+    msg = f"created: {path}"
+    if force:
+        msg += " [--force: structure + log-format validation overridden]"
+    print(msg)
+
+
+MIRROR_CARD = "Backlog/TEMPLATE CARD.md"
+
+
+def cmd_sync_template():
+    """Refresh the board mirror card from the canonical template file.
+    One-way (file -> card); the mirror's Log section is preserved."""
+    tpath = default_template_path()
+    with open(tpath) as f:
+        lines = f.read().splitlines()
+    howto = _tpl_section(lines, "How to use this template")
+    design = _tpl_section(lines, "Design notes")
+    body = _tpl_fenced_body(lines)
+    current = get_content(MIRROR_CARD)
+    log_lines = []
+    if current:
+        cl = current.splitlines()
+        log_idx = [i for i, l in enumerate(cl) if l.strip() == "## Log"]
+        if log_idx:
+            log_lines = cl[log_idx[-1]:]
+    if not log_lines:
+        log_lines = ["## Log"]
+    card = [
+        "",
+        "",
+        "# TEMPLATE CARD",
+        "",
+        "UI mirror of the canonical template at "
+        "`.pi/skills/tasks-board/card-template.md` — do not edit this card;",
+        "edit the file and run `tmd sync-template`.",
+        "",
+        "## How to use this template",
+        "",
+    ] + howto + [
+        "",
+        "## Design notes — how each open question was resolved",
+        "",
+    ] + design + [
+        "",
+        "## Template",
+        "",
+        "```",
+    ] + body + [
+        "```",
+        "",
+    ] + log_lines
+    content = "\n".join(card).rstrip("\n") + "\n"
+    violations = validate_card(content)
+    delta_lines, delta_nums = diff_log_lines(current, content)
+    if delta_lines:
+        prev_ts = _last_log_ts(current)
+        old_log_lines, old_log_nums = extract_log_lines(current)
+        prev_line = old_log_lines[-1] if old_log_lines else None
+        prev_line_num = old_log_nums[-1] if old_log_nums else None
+        violations.extend(validate_log_lines(delta_lines, delta_nums, prev_ts,
+                                             prev_line, prev_line_num))
+    if violations:
+        refuse_violations("sync-template", MIRROR_CARD, violations)
+    req("PATCH", "/resource/" + q(MIRROR_CARD), body={"content": content})
+    print(f"synced: {MIRROR_CARD} (from {tpath}; Log preserved)")
 
 
 def _outside_fences(lines):
@@ -235,10 +463,42 @@ def _outside_fences(lines):
     return outside
 
 
+# Canonical line-1 tag format: zero or more bracket groups, each [tag:<name>],
+# with NO commas inside a group (one group per tag). Spaces between groups are
+# allowed. An EMPTY line 1 (zero tags) is canonical — tags are pure flow
+# control, topics/projects live in the card body (Story).
+# This is the format `tmd tag` owns and the write path enforces.
+# A comma-joined group ('[tag:a,b]') is the corruption this gate refuses.
+TAG_LINE_RE = re.compile(r"^(\[tag:[^\[\],]+\]\s*)*$")
+
+# The only tags the write path accepts (line 1 is reserved for the
+# orchestrated refiner/implementer/reviewer loop: orchestrator + loop state).
+# `tmd tag --add` enforces this; `--remove` stays unrestricted so legacy
+# project tags can be migrated out. `tmd new-card --tag` accepts the
+# type-tag subset (spec/research). `refined` is the refiner's state flag
+# (added once, never removed; the orchestrator's Spec scan skips it, G5).
+FLOW_TAGS = {"review-by-ai", "ai-reviewed", "merge-pending", "vuln-scan",
+             "refined", "spec", "research"}
+TYPE_TAGS = {"spec", "research"}
+
+
+def tag_line_violation(line):
+    """Return a violation string if `line` is not a canonical tag line, else None.
+
+    A canonical tag line is zero or more [tag:<name>] groups with no commas
+    inside a group (e.g. '[tag:research][tag:review-by-ai]'); empty = no tags.
+    """
+    if not TAG_LINE_RE.match(line):
+        return ("line 1: must be zero or more [tag:...] groups with no commas "
+                "inside a group (e.g. [tag:research][tag:review-by-ai])")
+    return None
+
+
 def validate_card(content):
     """Structural validation (P2). Returns a list of violation strings
     (empty list = OK). Rules:
-      1. line 1 is a tag line (starts with '[tag:')
+      1. line 1 is a canonical tag line: zero or more [tag:<name>] groups with
+         no commas inside a group (one group per tag; TAG_LINE_RE)
       2. an H1 heading exists (a line starting with '# ')
       3. at most one standalone '## Log' heading (a line whose stripped text
          is exactly '## Log'); in-body quotes (backticks, table cells, code
@@ -249,8 +509,12 @@ def validate_card(content):
     """
     violations = []
     lines = content.splitlines()
-    if not lines or not lines[0].startswith("[tag:"):
-        violations.append("line 1: must be a tag line (starts with '[tag:')")
+    if not lines:
+        violations.append("line 1: card is empty (no tag line)")
+    else:
+        v = tag_line_violation(lines[0])
+        if v:
+            violations.append(v)
     outside = _outside_fences(lines)
     if not any(lines[i - 1].startswith("# ") for i in outside):
         violations.append("card: no H1 heading found (a line starting with '# ')")
@@ -541,6 +805,12 @@ def cmd_append(path, force=False):
         prev_line_num = cur_log_nums[-1] if cur_log_nums else None
         violations = validate_log_lines(
             delta_lines, delta_nums, prev_ts, prev_line, prev_line_num)
+        # Line-1 tag-format gate: append can't change line 1, but refuse to
+        # append to a card whose line 1 is already malformed (loud, not
+        # silent — the card must be fixed via `tmd tag` first).
+        v = tag_line_violation(current.split("\n", 1)[0])
+        if v:
+            violations.append(v)
         if violations:
             refuse_violations("append", path, violations)
     req("PATCH", "/resource/" + q(path), body={"content": result})
@@ -548,6 +818,87 @@ def cmd_append(path, force=False):
     if force:
         msg += " [--force: log-format validation overridden]"
     print(msg)
+
+
+def _parse_tag_line(line):
+    """Parse a tag line into (tags, was_comma_joined).
+
+    Accepts the canonical form (one [tag:...] group per tag, possibly zero —
+    an empty line 1 is a valid tag-free line), and the legacy comma-joined
+    corruption ([tag:a,b]) — splitting each group on commas so a corrupted
+    line is self-healable. Raises ValueError when the line has non-tag
+    content.
+    """
+    groups = re.findall(r"\[tag:([^\]]*)\]", line)
+    remainder = re.sub(r"\[tag:[^\]]*\]", "", line).strip()
+    if remainder:
+        raise ValueError(f"line 1 has non-tag content: {remainder!r}")
+    tags = []
+    was_comma = False
+    for g in groups:
+        if "," in g:
+            was_comma = True
+        for p in (x.strip() for x in g.split(",")):
+            if p:
+                tags.append(p)
+    return tags, was_comma
+
+
+def cmd_tag(path, adds, removes):
+    """Deterministically edit a card's line-1 tags (surgical, line 1 only).
+
+    `tmd tag <Lane/card> --add <tag> [--add ...] --remove <tag> [--remove ...]`
+
+    Owns the canonical line-1 format (one [tag:...] group per tag, no commas
+    inside a group; an empty line 1 is valid — zero tags). Rewrites line 1
+    ONLY — no full-card rewrite (no D2 risk). Idempotent: add-existing /
+    remove-absent are printed no-ops. Self-heals legacy comma-joined groups
+    (normalizes to one group per tag). Refuses when line 1 has non-tag
+    content; validates tag names (no brackets/commas; spaces allowed);
+    --add accepts FLOW_TAGS only (line 1 is pure flow control), --remove
+    any tag (legacy project tags must be removable).
+    """
+    path = ensure_md(path)
+    for t in adds + removes:
+        if not t or "[" in t or "]" in t or "," in t:
+            die(f"tag: invalid tag name {t!r} (no brackets/commas; "
+                f"spaces allowed)")
+    for t in adds:
+        if t not in FLOW_TAGS:
+            die(f"tag: refusing to add {t!r} — line 1 is reserved for flow "
+                f"tags; allowed: {', '.join(sorted(FLOW_TAGS))}")
+    content = get_content(path)
+    lines = content.split("\n")
+    if not lines:
+        die(f"tag: {path} is empty (no line 1)")
+    try:
+        tags, was_comma = _parse_tag_line(lines[0])
+    except ValueError as e:
+        die(f"tag: refusing — {e}")
+    # Apply removes (idempotent).
+    for t in removes:
+        if t in tags:
+            tags.remove(t)
+            print(f"removed: {t}")
+        else:
+            print(f"no-op (absent): {t}")
+    # Apply adds (idempotent).
+    for t in adds:
+        if t in tags:
+            print(f"no-op (present): {t}")
+        else:
+            tags.append(t)
+            print(f"added: {t}")
+    new_first = "".join(f"[tag:{t}]" for t in tags)
+    if was_comma:
+        print("self-healed: comma-joined tag group(s) normalized to one "
+              "group per tag")
+    if new_first == lines[0]:
+        print(f"unchanged: {path}")
+        return
+    lines[0] = new_first
+    req("PATCH", "/resource/" + q(path), body={"content": "\n".join(lines)})
+    print(f"updated line 1: {path} -> {new_first}")
 
 
 def cmd_move(src, dst):
@@ -560,6 +911,7 @@ def cmd_move(src, dst):
     dp, dlane, _ = split_path(dst)
     if sp != dp:
         die("move within one project only (v1)")
+    check_board_name(dst)  # raw newPath in the body — q() only sees src
     req("PATCH", "/resource/" + q(src), body={"newPath": dst})
     # The move endpoint does NOT update sort state — do it here (as the UI does).
     name = scard.removesuffix(".md")
@@ -649,6 +1001,12 @@ def cmd_reorder(lane_arg, csv):
 
 
 def cmd_rm(path):
+    if path.endswith(".md"):
+        # The API's DELETE is idempotent (2xx even for a missing file) —
+        # verify the card is actually in the target lane, or a stale path
+        # "succeeds" while the card survives in its new lane (e.g. moved by
+        # the orchestrator between list and rm).
+        get_content(path)
     req("DELETE", "/resource/" + q(path))
     # Keep the sort map in sync: a deleted card/lane must not linger in it
     # (stale entries are ghosts for /_api/sort consumers like the orchestrator).
@@ -694,8 +1052,39 @@ def main():
         cmd_get(args[0])
     elif cmd == "new-lane" and len(args) == 1:
         cmd_new_lane(args[0])
-    elif cmd == "new-card" and len(args) == 1:
-        cmd_new_card(args[0])
+    elif cmd == "new-card":
+        force = "--force" in args
+        template, tag, actor = None, None, "agent"
+        paths, i = [], 0
+        while i < len(args):
+            a = args[i]
+            if a == "--force":
+                pass
+            elif a == "--template":
+                # Flag (canonical default) or --template <file>
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    i += 1
+                    template = args[i]
+                else:
+                    template = default_template_path()
+            elif a in ("--tag", "--actor"):
+                i += 1
+                if i >= len(args):
+                    die(f"usage error: {a} requires a value")
+                if a == "--tag":
+                    tag = args[i]
+                else:
+                    actor = args[i]
+                    if actor not in ("agent", "human"):
+                        die("usage error: --actor must be agent|human")
+            else:
+                paths.append(a)
+            i += 1
+        if len(paths) != 1:
+            die("usage error: tmd new-card <Lane/card.md> [--template <file>] "
+                "[--tag spec|research] [--actor agent|human] [--force]")
+        cmd_new_card(paths[0], force=force, template=template, tag=tag,
+                     actor=actor)
     elif cmd == "edit" and 1 <= len(args) <= 2:
         force = "--force" in args
         paths = [a for a in args if a != "--force"]
@@ -716,6 +1105,31 @@ def main():
         if len(paths) != 1:
             die(f"usage error: tmd {cmd} <Lane/card.md> [--force]")
         cmd_append(paths[0], force=force)
+    elif cmd == "tag":
+        adds, removes, path = [], [], None
+        i = 0
+        while i < len(args):
+            if args[i] == "--add":
+                i += 1
+                if i >= len(args):
+                    die("usage error: tmd tag --add requires a tag")
+                adds.append(args[i])
+            elif args[i] == "--remove":
+                i += 1
+                if i >= len(args):
+                    die("usage error: tmd tag --remove requires a tag")
+                removes.append(args[i])
+            elif path is None:
+                path = args[i]
+            else:
+                die(f"usage error: unexpected argument {args[i]!r} "
+                    f"(usage: tmd tag <Lane/card> --add <t> [--add ...] "
+                    f"--remove <t> [--remove ...])")
+            i += 1
+        if path is None:
+            die("usage error: tmd tag <Lane/card> --add <t> [--add ...] "
+                "--remove <t> [--remove ...]")
+        cmd_tag(path, adds, removes)
     elif cmd == "move" and len(args) == 2:
         cmd_move(args[0], args[1])
     elif cmd == "claim" and len(args) == 1:
@@ -728,6 +1142,8 @@ def main():
         cmd_rm(args[0])
     elif cmd == "img" and len(args) == 1:
         cmd_img(args[0])
+    elif cmd == "sync-template" and len(args) == 0:
+        cmd_sync_template()
     else:
         die(f"usage error: tmd {cmd} ...")
 

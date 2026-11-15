@@ -33,14 +33,28 @@ receivers:
     collection_interval: 15s
     timeout: 20s
 
-  # ── Host-level CPU / memory / load ──────────────────────────────────────────
-  # Reads /proc from within the container — valid for cpu/mem/load without host mounts
+  # ── Host-level CPU / memory / load / swap ──────────────────────────────────
+  # Reads /proc from within the container — /proc/meminfo and /proc/swaps are
+  # not PID-namespace-isolated, so cpu/mem/load/paging report true host values.
   host_metrics:
     collection_interval: 30s
     scrapers:
       cpu: {}
-      memory: {}
+      memory:
+        metrics:
+          # MemAvailable — a more accurate "headroom" figure than free (it
+          # counts reclaimable cache). Drives the RAM-pressure dashboard's
+          # effective-headroom stat.
+          system.linux.memory.available:
+            enabled: true
       load: {}
+      # Swap / paging: usage (free/used) + I/O (bytes + operations, in/out).
+      paging: {}
+      # NOTE: a `process` scraper (per-process host RAM) is a documented
+      # follow-up — it needs `pid: host` + SYS_PTRACE/root to run clean, which
+      # is a privilege escalation beyond this card's config-only scope. See the
+      # card's Question section. The dashboard's "Top RAM consumer" panel uses
+      # container_memory_usage_total_bytes (docker_stats) instead.
 
   # ── Container logs (Docker JSON log driver) ──────────────────────────────────
   # Requires volume: /var/lib/docker/containers:/var/log/docker:ro
