@@ -1,40 +1,37 @@
 # gromacs-md — usage
 
-The `gromacs-md` agent runs a GROMACS MD simulation end to end:
+The `gromacs-md` session runs a GROMACS MD simulation end to end:
 PDB → prep → solvation → EM → NVT → NPT → production → analysis report →
 cleanup. It owns its own state machine (the `gromacs-sim` skill), gates every
 phase with deterministic scripts, and resumes exactly where it left off.
 
 ## Invoking
 
-From a **pi session running on the iGPU** (see constraint below):
+From the **stack root**, launch the dedicated gromacs-md session (a vanilla
+pi session with the gromacs-md persona, pinned to the iGPU — see constraint
+below):
 
 ```
-/gromacs-md <simulation name>          # new simulation
-/gromacs-md <existing project name>    # resume
+./scripts/pi-gromacs
 ```
 
-or in plain language: "run me a 5 ns simulation of PDB 1ABC with the
-gromacs-md agent".
+Then ask in plain language: "run me a 5 ns simulation of PDB 1ABC" (new
+simulation), or name an existing project to resume it.
 
 Projects live in `gromacs/work/projects/<sim>/` with `state.json`,
 `RUNLOG.md`, and one directory per phase.
 
 ## ⚠️ Launcher constraint (read this first)
 
-**The session that launches the agent must itself be running on the iGPU.**
+**The gromacs-md session runs on the iGPU — clear any eGPU session before a
+GPU phase.**
 
-The agent's LLM is pinned to the iGPU llama-server (single slot). When a
-GPU phase needs `gromacs` mode, the agent runs `make gromacs`, which stops
-the eGPU services — **including the LLM of any session running on the eGPU**.
-If you launch from an eGPU session, the mode switch kills your own session
-mid-run. From an iGPU session the switch is safe: neither parent nor child
-depends on the eGPU.
-
-If you are on the eGPU and want to launch anyway: start the agent in
-`gromacs` mode is impossible (the agent refuses to switch while its own
-compute is at risk — it will hard-stop and tell you). Switch your session
-to the iGPU first.
+The session's LLM is pinned to the iGPU llama-server (single slot), so the
+run itself is safe from mode switches. But when a GPU phase needs `gromacs`
+mode, the session runs `make gromacs`, which stops the eGPU services —
+**including the LLM of any session running on the eGPU** (e.g. your main pi
+session). If you have a session running on the eGPU, finish or pause it
+before starting a GROMACS run, or the mode switch kills it mid-run.
 
 ## What to expect
 
@@ -65,8 +62,9 @@ to the iGPU first.
 
 - `state.json` is the source of truth: `phase` + `phase_status` + file
   pointers. `RUNLOG.md` is the human-readable history.
-- Any session can resume any project: `/gromacs-md <sim>` — the agent
-  reads state first, verifies the last artifact, continues.
+- Any session can resume any project: `./scripts/pi-gromacs`, then name
+  the project — the session reads state first, verifies the last artifact,
+  continues.
 - A `running` production run with a dead process: the agent reads the log,
   and resumes from `state.cpt` if a checkpoint exists (max lost time ≈
   checkpoint interval, ~100 ps).

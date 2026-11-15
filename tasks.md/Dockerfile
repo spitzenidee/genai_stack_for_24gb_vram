@@ -59,6 +59,11 @@ if [ ! -f "${CONFIG_DIR}/stylesheets/custom.css" ]; then
   echo "@import url(${BASE_PATH}/stylesheets/color-themes/adwaita.css)" > "${CONFIG_DIR}/stylesheets/custom.css"
 fi
 
+# Default tag chip colors (first start only; user edits via the UI win)
+if [ ! -f "${CONFIG_DIR}/tags.json" ]; then
+  cp /tags.json "${CONFIG_DIR}/tags.json"
+fi
+
 # Serve user CSS from config/, keep built-in themes available in config/
 cp -r "${CONFIG_DIR}/stylesheets/." /api/static/stylesheets/
 cp -r /api/static/stylesheets/. "${CONFIG_DIR}/stylesheets/"
@@ -71,6 +76,9 @@ cd /api
 exec node server.js
 ENTRYPOINT
 RUN chmod +x /entrypoint.sh
+
+# Canonical tag chip color mapping (seeded into /config on first start)
+COPY tags.json /tags.json
 
 COPY --from=build /src/frontend/dist /api/static
 COPY --from=build /src/backend /api

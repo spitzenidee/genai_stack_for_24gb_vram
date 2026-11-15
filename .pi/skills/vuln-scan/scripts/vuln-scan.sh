@@ -1,14 +1,22 @@
 #!/bin/sh
-# vuln-scan — vulnerability scanning wrapper (Trivy + Semgrep CE + slopsquatting).
+# vuln-scan — vulnerability scanning wrapper (Trivy + Semgrep CE +
+# ShellCheck + slopsquatting).
 #
 # Runs dockerized scanners in transient containers (tmd pattern: sh + docker,
-# no host deps). Three subcommands:
+# no host deps). Four subcommands:
 #
-#   vuln-scan repo <path>    trivy fs (vuln + secret, MEDIUM+) AND semgrep
-#                            (explicit rulesets p/python, p/javascript,
-#                            p/typescript) AND the slopsquatting tier
-#                            (depsafe: Python names; sloppy-joe: 8 ecosystems)
-#                            over the repo at <path>
+#   vuln-scan repo <path>    trivy fs (vuln + secret + misconfig, MEDIUM+)
+#                            AND semgrep (explicit rulesets p/python,
+#                            p/javascript, p/typescript, p/java, p/rust,
+#                            p/dockerfile + the in-skill compose ruleset
+#                            semgrep-compose.yaml) AND shellcheck (shell
+#                            SAST) AND the slopsquatting tier (depsafe:
+#                            Python names; sloppy-joe: 8 ecosystems) over
+#                            the repo at <path>
+#   vuln-scan changed <path> [base-ref]
+#                            same tiers, but only over git-changed paths
+#                            (vs base-ref, default HEAD: staged + unstaged
+#                            tracked changes + untracked non-ignored files)
 #   vuln-scan image <name>   trivy image <name> (via docker.sock)
 #   vuln-scan build          build the local scanner images (depsafe +
 #                            sloppy-joe) from docker/*.Dockerfile
@@ -19,7 +27,8 @@
 #   Override the results root with VULN_SCAN_RESULTS_DIR.
 #
 # All tunables (images, scanners, severity, rulesets, skip dirs, results
-# root, summary cap, slopsquatting images + online mode) are configurable
+# root, summary cap, slopsquatting images + online mode, shellcheck image)
+# are configurable
 # via vuln-scan.env next to scripts/ (precedence: explicit env var >
 # vuln-scan.env > built-in default). Privacy invariants stay hardcoded
 # (see below).
@@ -30,7 +39,9 @@
 # Privacy (hard requirement):
 #   - every trivy invocation: --disable-telemetry --skip-version-check
 #   - every semgrep invocation: --metrics off + explicit rulesets only
-#     (never --config auto, which phones home to the Semgrep Registry)
+#     (never --config auto, which phones home to the Semgrep Registry);
+#     the in-skill compose ruleset is mounted :ro from the skill dir
+#   - shellcheck is a static binary in an alpine image — fully offline
 #   - slopsquatting tier is OFFLINE by default (VULN_SCAN_SLOPSQUAT_ONLINE=0):
 #     depsafe uses its built-in corpus, sloppy-joe runs the fast local
 #     guardrail. Online mode (=1) sends only package NAMES to the registries
@@ -39,7 +50,8 @@
 #
 # Scanner images are pinned in vuln-scan.env; pulled on demand if not
 # present. The two slopsquatting images are local builds (docker/*.Dockerfile)
-# and are built on demand (or via `vuln-scan build`) when missing.
+# and are built on demand (or via `vuln-scan build`) when missing. The
+# The shellcheck image is a registry pull (koalaman/shellcheck-alpine).
 # A scanner failure does NOT abort the run: whatever JSON was produced is
 # kept and summarized; the wrapper exits 1 only if no report was produced.
 #
@@ -66,9 +78,10 @@ cfg() {
 
 _v=$(cfg VULN_SCAN_TRIVY_IMAGE);      TRIVY_IMAGE="${VULN_SCAN_TRIVY_IMAGE:-${_v:-aquasec/trivy:0.76.0}}"
 _v=$(cfg VULN_SCAN_SEMGREP_IMAGE);    SEMGREP_IMAGE="${VULN_SCAN_SEMGREP_IMAGE:-${_v:-semgrep/semgrep:1.180.0}}"
-_v=$(cfg VULN_SCAN_TRIVY_SCANNERS);   TRIVY_SCANNERS="${VULN_SCAN_TRIVY_SCANNERS:-${_v:-vuln,secret}}"
+_v=$(cfg VULN_SCAN_SHELLCHECK_IMAGE); SHELLCHECK_IMAGE="${VULN_SCAN_SHELLCHECK_IMAGE:-${_v:-koalaman/shellcheck-alpine:v0.11.0}}"
+_v=$(cfg VULN_SCAN_TRIVY_SCANNERS);   TRIVY_SCANNERS="${VULN_SCAN_TRIVY_SCANNERS:-${_v:-vuln,secret,misconfig}}"
 _v=$(cfg VULN_SCAN_TRIVY_SEVERITY);   TRIVY_SEVERITY="${VULN_SCAN_TRIVY_SEVERITY:-${_v:-MEDIUM,HIGH,CRITICAL}}"
-_v=$(cfg VULN_SCAN_SEMGREP_RULESETS); SEMGREP_RULESETS="${VULN_SCAN_SEMGREP_RULESETS:-${_v:-p/python,p/javascript,p/typescript}}"
+_v=$(cfg VULN_SCAN_SEMGREP_RULESETS); SEMGREP_RULESETS="${VULN_SCAN_SEMGREP_RULESETS:-${_v:-p/python,p/javascript,p/typescript,p/java,p/rust,p/dockerfile}}"
 _v=$(cfg VULN_SCAN_SUMMARY_LIMIT);    SUMMARY_LIMIT="${VULN_SCAN_SUMMARY_LIMIT:-${_v:-40}}"
 _v=$(cfg VULN_SCAN_SKIP_DIRS);        SKIP_DIRS="${VULN_SCAN_SKIP_DIRS:-${_v:-.git,work,_dl,hfmodels,models,node_modules,__pycache__,.venv,venv,dist,build}}"
 _v=$(cfg VULN_SCAN_RESULTS_DIR);      RESULTS_ROOT="${VULN_SCAN_RESULTS_DIR:-${_v:-$STACK_ROOT/work/vuln_scan_results}}"
@@ -84,6 +97,7 @@ die() { echo "vuln-scan: $*" >&2; exit 2; }
 
 usage() {
   echo "Usage: vuln-scan repo <path>" >&2
+  echo "       vuln-scan changed <path> [base-ref]" >&2
   echo "       vuln-scan image <name>" >&2
   echo "       vuln-scan build" >&2
   exit 2
@@ -154,6 +168,47 @@ semgrep_configs() {
   printf '%s' "$_out"
 }
 
+# skip_dir_find_args — print find predicates (-not -path */<name>/*) for
+# every name in SKIP_DIRS (space-separated; names contain no spaces).
+skip_dir_find_args() {
+  _sd=$SKIP_DIRS
+  _out=""
+  while [ -n "$_sd" ]; do
+    _name=${_sd%%,*}
+    case "$_sd" in
+      *,*) _sd=${_sd#*,} ;;
+      *) _sd="" ;;
+    esac
+    [ -n "$_name" ] && _out="$_out -not -path */$_name/*"
+  done
+  printf '%s' "$_out"
+}
+
+# list_shell_files <target> — print shell scripts under <target> (one per
+# line), excluding SKIP_DIRS. Extension-based (*.sh, *.bash); shellcheck
+# itself re-checks each file and skips non-shell content. set -f guards the
+# unquoted find-arg expansion against globbing (*/work/* would otherwise be
+# expanded against the CWD).
+list_shell_files() {
+  set -f
+  find "$1" -type f \( -name '*.sh' -o -name '*.bash' \) $(skip_dir_find_args) 2>/dev/null
+  set +f
+}
+
+# In-skill docker-compose ruleset (Semgrep YAML), mounted :ro into the
+# semgrep container — same pattern as the sloppy-joe config mount (never
+# from the scanned repo). Two helpers: the docker-run -v mount and the
+# semgrep --config flag (they belong to different argument positions).
+COMPOSE_RULES="$DIR/../semgrep-compose.yaml"
+compose_rules_mount() { # prints "-v <src>:/rules/semgrep-compose.yaml:ro" or nothing
+  [ -f "$COMPOSE_RULES" ] || return 0
+  printf -- "-v %s:/rules/semgrep-compose.yaml:ro" "$COMPOSE_RULES"
+}
+compose_rules_config() { # prints "--config /rules/semgrep-compose.yaml" or nothing
+  [ -f "$COMPOSE_RULES" ] || return 0
+  printf -- "--config /rules/semgrep-compose.yaml"
+}
+
 # run_python <json-file> <kind: trivy|semgrep|depsafe|sloppy-joe> — print the severity summary.
 # Host python3 if present, else the semgrep image's python3 (dependency-free
 # guarantee: sh + docker only).
@@ -196,6 +251,12 @@ if kind == "trivy":
             loc = f"{target}:{s.get('StartLine', '?')}"
             findings.append((sev, s.get("RuleID") or "?",
                              (s.get("Title") or "").replace("\n", " ")[:90], loc))
+        for m in r.get("Misconfigurations") or []:
+            sev = (m.get("Severity") or "UNKNOWN").upper()
+            counts[sev] = counts.get(sev, 0) + 1
+            loc = f"{target}:{m.get('StartLine', '?')}"
+            findings.append((sev, m.get("ID") or "?",
+                             (m.get("Title") or "").replace("\n", " ")[:90], loc))
 elif kind == "depsafe":
     # severity_counts: {critical,high,medium,low,info}; findings: [{name, rule,
     # rule_name, severity, message, file, ...}]
@@ -220,6 +281,19 @@ elif kind == "semgrep":  # INFO/WARNING/ERROR -> LOW/MEDIUM/HIGH
         loc = f"{p}:{(r.get('start') or {}).get('line', '?')}"
         msg = (extra.get("message") or "").replace("\n", " ")[:90]
         findings.append((sev, r.get("check_id") or "?", msg, loc))
+elif kind == "shellcheck":  # top-level JSON array; level -> severity
+    # shellcheck levels: error|warning|info|style -> HIGH|MEDIUM|LOW|LOW
+    sevmap = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW", "STYLE": "LOW"}
+    for f in d if isinstance(d, list) else []:
+        sev = sevmap.get((f.get("level") or "info").upper(), "LOW")
+        counts[sev] = counts.get(sev, 0) + 1
+        p = f.get("file", "?")
+        if p.startswith("/src/"):
+            p = p[len("/src/"):]
+        loc = f"{p}:{f.get('line', '?')}"
+        msg = (f.get("message") or "").replace("\n", " ")[:90]
+        fid = f"SC{f['code']}" if f.get("code") else "shellcheck"
+        findings.append((sev, fid, msg, loc))
 else:  # sloppy-joe: issues: [{package, check, severity(Error|Warning), message}]
     sevmap = {"ERROR": "HIGH", "WARNING": "MEDIUM"}
     for i in d.get("issues") or []:
@@ -279,6 +353,41 @@ scan() {
   return 1
 }
 
+# print_summary <label> <outdir> <sq_mode> <sh_skip> <dep_skip> <sj_skip>
+# Prints the stdout summary for every report in <outdir> and names any
+# expected tier that produced no JSON (a dropped scanner is never silent).
+# A tier that was intentionally skipped (nothing to scan) is NOT a WARNING
+# — it was already noted on stderr.
+print_summary() {
+  _label=$1; _outdir=$2; _sq_mode=$3; _sh_skip=$4; _dep_skip=$5; _sj_skip=$6
+  echo ""
+  echo "== vuln-scan: $_label =="
+  for f in "$_outdir/$TS-trivy.json" "$_outdir/$TS-semgrep.json" \
+           "$_outdir/$TS-shellcheck.json" "$_outdir/$TS-depsafe.json" \
+           "$_outdir/$TS-sloppy-joe.json"; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *trivy.json) echo "[trivy: $TRIVY_SCANNERS]"; summarize "$f" trivy ;;
+      *semgrep.json) echo "[semgrep: SAST $SEMGREP_RULESETS + compose rules]"; summarize "$f" semgrep ;;
+      *shellcheck.json) echo "[shellcheck: shell SAST]"; summarize "$f" shellcheck ;;
+      *depsafe.json) echo "[depsafe: Python typosquat/slopsquat, $_sq_mode]"; summarize "$f" depsafe ;;
+      *) echo "[sloppy-joe: 8-ecosystem slopsquat/provenance, $_sq_mode]"; summarize "$f" sloppy-joe ;;
+    esac
+  done
+  for _exp in trivy semgrep; do
+    [ -f "$_outdir/$TS-$_exp.json" ] || \
+      echo "WARNING: no $_exp report produced (see stderr above)"
+  done
+  [ "$_sh_skip" = 1 ] || { [ -f "$_outdir/$TS-shellcheck.json" ] || \
+    echo "WARNING: no shellcheck report produced (see stderr above)"; }
+  [ "$_dep_skip" = 1 ] || { [ -f "$_outdir/$TS-depsafe.json" ] || \
+    echo "WARNING: no depsafe report produced (see stderr above)"; }
+  [ "$_sj_skip" = 1 ] || { [ -f "$_outdir/$TS-sloppy-joe.json" ] || \
+    echo "WARNING: no sloppy-joe report produced (see stderr above)"; }
+  echo ""
+  echo "Reports: $_outdir/$TS-*.json"
+}
+
 cmd=${1:-}
 target=${2:-}
 [ -n "$cmd" ] || usage
@@ -287,6 +396,10 @@ target=${2:-}
 case "$cmd" in
   repo)
     [ -d "$target" ] || die "not a directory: $target"
+    # Resolve to an absolute path: docker parses a relative -v source as a
+    # named volume (every scanner exits 125, no reports), so relative repo
+    # paths must be absolutized before any mount.
+    target=$(cd "$target" && pwd) || die "cannot resolve absolute path: $target"
     short=$(basename "$target" | tr ':/' '--')
     outdir="$RESULTS_ROOT/$short"
     mkdir -p "$outdir" || die "cannot create $outdir"
@@ -300,6 +413,28 @@ case "$cmd" in
       _sq_mode=offline
     fi
 
+    # sloppy-joe has no skip-dirs flag upstream: it mounts the whole repo at
+    # /src and resolves the Python environment as part of `check`. A host
+    # venv (e.g. .venv) has a bin/python3 symlink that is broken from the
+    # container's view (the image is a Rust static binary with no host
+    # Python), so sloppy-joe exits 2 with no report — a silent loss of the
+    # tier. Hide every SKIP_DIRS path that exists in the target by mounting
+    # an empty dir over it under /src (reuses the existing SKIP_DIRS config),
+    # so sloppy-joe never sees a host venv.
+    EMPTY_DIR=$(mktemp -d) || die "cannot create temp dir for skip-dir overlays"
+    trap 'rm -rf "$EMPTY_DIR"' EXIT
+    _sj_overlays=""
+    _sd=$SKIP_DIRS
+    while [ -n "$_sd" ]; do
+      _name=${_sd%%,*}
+      case "$_sd" in
+        *,*) _sd=${_sd#*,} ;;
+        *) _sd="" ;;
+      esac
+      [ -n "$_name" ] || continue
+      [ -d "$target/$_name" ] && _sj_overlays="$_sj_overlays -v $EMPTY_DIR:/src/$_name:ro"
+    done
+
     ok=0
     scan trivy "$TRIVY_IMAGE" trivy.json "$outdir" \
       -v "$target:/src:ro" -v "$outdir:/out" \
@@ -312,11 +447,32 @@ case "$cmd" in
 
     scan semgrep "$SEMGREP_IMAGE" semgrep.json "$outdir" \
       -v "$target:/src:ro" -v "$outdir:/out" \
+      $(compose_rules_mount) \
       "$SEMGREP_IMAGE" semgrep scan \
       $(semgrep_configs) \
+      $(compose_rules_config) \
       --metrics off --quiet \
       $(semgrep_excludes) \
       --json-output /out/semgrep.json /src && ok=1
+
+    # ShellCheck tier: shell SAST (unquoted expansions, lost exit codes, ...).
+    # JSON on stdout ([] when clean). Extension-based file list with skip
+    # dirs respected; no shell files -> tier skipped (informational, not a
+    # WARNING — there is simply nothing to scan).
+    _sh_files=$(list_shell_files "$target")
+    _shellcheck_skipped=0
+    if [ -n "$_sh_files" ]; then
+      _sh_args=""
+      for _f in $_sh_files; do
+        _sh_args="$_sh_args /src/${_f#"$target"/}"
+      done
+      scan shellcheck "$SHELLCHECK_IMAGE" shellcheck.json "$outdir" \
+        -v "$target:/src:ro" -v "$outdir:/out" \
+        "$SHELLCHECK_IMAGE" shellcheck --format json $_sh_args && ok=1
+    else
+      _shellcheck_skipped=1
+      echo "vuln-scan: [shellcheck] no shell scripts found (tier skipped)" >&2
+    fi
 
     # depsafe: Python typosquatting / slopsquatting (built-in corpus; offline
     # by default, --online = PyPI name queries). JSON on stdout.
@@ -336,26 +492,253 @@ case "$cmd" in
     mkdir -p "$RESULTS_ROOT/.cache/sloppy-joe" 2>/dev/null || true
     scan sloppy-joe "$SLOPPYJOE_IMAGE" sloppy-joe.json "$outdir" \
       -v "$target:/src:ro" -v "$outdir:/out" \
+      $_sj_overlays \
       -v "$DIR/../docker:/config:ro" \
       -v "$RESULTS_ROOT/.cache/sloppy-joe:/cache" \
       "$SLOPPYJOE_IMAGE" $_sj_args && ok=1
 
     [ "$ok" = 1 ] || die "no reports produced (all scanners failed)"
 
-    echo ""
-    echo "== vuln-scan: $short =="
-    for f in "$outdir/$TS-trivy.json" "$outdir/$TS-semgrep.json" \
-             "$outdir/$TS-depsafe.json" "$outdir/$TS-sloppy-joe.json"; do
-      [ -f "$f" ] || continue
-      case "$f" in
-        *trivy.json) echo "[trivy: $TRIVY_SCANNERS]"; summarize "$f" trivy ;;
-        *semgrep.json) echo "[semgrep: SAST $SEMGREP_RULESETS]"; summarize "$f" semgrep ;;
-        *depsafe.json) echo "[depsafe: Python typosquat/slopsquat, $_sq_mode]"; summarize "$f" depsafe ;;
-        *) echo "[sloppy-joe: 8-ecosystem slopsquat/provenance, $_sq_mode]"; summarize "$f" sloppy-joe ;;
+    print_summary "$short" "$outdir" "$_sq_mode" "$_shellcheck_skipped" 0 0
+    ;;
+
+  changed)
+    [ -d "$target" ] || die "not a directory: $target"
+    target=$(cd "$target" && pwd) || die "cannot resolve absolute path: $target"
+    base_ref=${3:-HEAD}
+    git -C "$target" rev-parse --git-dir >/dev/null 2>&1 || \
+      die "not a git repository: $target (changed mode needs git)"
+    git -C "$target" rev-parse --verify "$base_ref" >/dev/null 2>&1 || \
+      die "unknown base ref: $base_ref"
+
+    # Changed set = tracked files differing from base_ref (staged +
+    # unstaged; deletions are listed too) + untracked non-ignored files.
+    # Deletions are dropped (no longer on disk). Skip dirs are respected.
+    _changed=$(
+      { git -C "$target" diff --name-only "$base_ref" 2>/dev/null
+        git -C "$target" ls-files --others --exclude-standard
+      } | sort -u
+    )
+    _files=""
+    _n=0
+    while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      [ -f "$target/$_p" ] || continue
+      _skip=0
+      _sd=$SKIP_DIRS
+      while [ -n "$_sd" ]; do
+        _name=${_sd%%,*}
+        case "$_sd" in
+          *,*) _sd=${_sd#*,} ;;
+          *) _sd="" ;;
+        esac
+        [ -n "$_name" ] || continue
+        case "/$_p/" in
+          *"/$_name/") _skip=1; break ;;
+        esac
+      done
+      [ "$_skip" = 1 ] && continue
+      _files="$_files /src/$_p"
+      _n=$((_n + 1))
+    done <<EOF
+$_changed
+EOF
+    if [ "$_n" -eq 0 ]; then
+      echo "vuln-scan: no changed files vs $base_ref (nothing to scan)"
+      exit 0
+    fi
+
+    short=$(basename "$target" | tr ':/' '--')
+    outdir="$RESULTS_ROOT/$short"
+    mkdir -p "$outdir" || die "cannot create $outdir"
+    echo "vuln-scan: changed=$short base=$base_ref files=$_n out=$outdir ts=$TS"
+
+    if [ "$SLOPSQUAT_ONLINE" = "1" ]; then
+      _sq_mode=online
+    else
+      _sq_mode=offline
+    fi
+
+    # sloppy-joe overlays (skip dirs hidden under /src) — only needed when
+    # the tier runs (a manifest/lockfile is in the changed set).
+    EMPTY_DIR=$(mktemp -d) || die "cannot create temp dir for skip-dir overlays"
+    trap 'rm -rf "$EMPTY_DIR"' EXIT
+    _sj_overlays=""
+    _sd=$SKIP_DIRS
+    while [ -n "$_sd" ]; do
+      _name=${_sd%%,*}
+      case "$_sd" in
+        *,*) _sd=${_sd#*,} ;;
+        *) _sd="" ;;
+      esac
+      [ -n "$_name" ] || continue
+      [ -d "$target/$_name" ] && _sj_overlays="$_sj_overlays -v $EMPTY_DIR:/src/$_name:ro"
+    done
+
+    ok=0
+    # trivy: fs accepts a SINGLE target — one changed file runs directly,
+    # multiple files run per-file with the JSON reports merged (concatenate
+    # Results). Each scanner picks what it understands per file (lockfiles
+    # for vuln, Dockerfiles for misconfig, everything for secret).
+    if [ "$_n" -eq 1 ]; then
+      scan trivy "$TRIVY_IMAGE" trivy.json "$outdir" \
+        -v "$target:/src:ro" -v "$outdir:/out" \
+        "$TRIVY_IMAGE" fs \
+        --scanners "$TRIVY_SCANNERS" \
+        --severity "$TRIVY_SEVERITY" \
+        --quiet --disable-telemetry --skip-version-check \
+        --format json -o /out/trivy.json $_files && ok=1
+    else
+      # Direct docker runs (not scan()): scan() renames every report to
+      # $TS-<label>.json, so per-file runs would overwrite each other.
+      ensure_image "$TRIVY_IMAGE"
+      _i=0
+      for _f in $_files; do
+        _i=$((_i + 1))
+        echo "vuln-scan: running trivy ($TRIVY_IMAGE) [$_i/$_n: ${_f#/src/}] ..." >&2
+        docker run --rm -i \
+          -v "$target:/src:ro" -v "$outdir:/out" \
+          "$TRIVY_IMAGE" fs \
+          --scanners "$TRIVY_SCANNERS" \
+          --severity "$TRIVY_SEVERITY" \
+          --quiet --disable-telemetry --skip-version-check \
+          --format json -o "/out/$TS-trivy-$_i.json" "$_f" >/dev/null 2>&1 || true
+      done
+      run_python "$outdir" "$TS" <<'PYEOF'
+import json, glob, os, sys
+outdir, ts = sys.argv[1], sys.argv[2]
+files = sorted(glob.glob(os.path.join(outdir, ts + "-trivy-*.json")))
+merged = {"Results": []}
+n = 0
+for p in files:
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    n += 1
+    merged["Results"].extend(d.get("Results") or [])
+    os.remove(p)
+if n:
+    with open(os.path.join(outdir, ts + "-trivy.json"), "w") as f:
+        json.dump(merged, f, indent=2)
+    print(f"vuln-scan: [trivy] merged {n} per-file report(s)", file=sys.stderr)
+PYEOF
+      [ -f "$outdir/$TS-trivy.json" ] && ok=1
+    fi
+
+    scan semgrep "$SEMGREP_IMAGE" semgrep.json "$outdir" \
+      -v "$target:/src:ro" -v "$outdir:/out" \
+      $(compose_rules_mount) \
+      "$SEMGREP_IMAGE" semgrep scan \
+      $(semgrep_configs) \
+      $(compose_rules_config) \
+      --metrics off --quiet \
+      --json-output /out/semgrep.json $_files && ok=1
+
+    # ShellCheck: only the changed shell scripts.
+    _sh_changed=""
+    for _f in $_files; do
+      case "$_f" in
+        *.sh|*.bash) _sh_changed="$_sh_changed $_f" ;;
       esac
     done
-    echo ""
-    echo "Reports: $outdir/$TS-*.json"
+    _shellcheck_skipped=0
+    if [ -n "$_sh_changed" ]; then
+      scan shellcheck "$SHELLCHECK_IMAGE" shellcheck.json "$outdir" \
+        -v "$target:/src:ro" -v "$outdir:/out" \
+        "$SHELLCHECK_IMAGE" shellcheck --format json $_sh_changed && ok=1
+    else
+      _shellcheck_skipped=1
+      echo "vuln-scan: [shellcheck] no changed shell scripts (tier skipped)" >&2
+    fi
+
+    # depsafe: only the changed Python dependency files. depsafe takes a
+    # single path — run per file, merge the JSON reports into one.
+    _dep_changed=""
+    for _f in $_files; do
+      case "$_f" in
+        *requirements*.txt|*pyproject.toml|*Pipfile) _dep_changed="$_dep_changed $_f" ;;
+      esac
+    done
+    _depsafe_skipped=0
+    if [ -n "$_dep_changed" ]; then
+      # Direct docker runs (not scan()): per-file reports keep their own
+      # names so the merge below can combine them.
+      ensure_image "$DEPSAFE_IMAGE"
+      _i=0
+      for _f in $_dep_changed; do
+        _i=$((_i + 1))
+        echo "vuln-scan: running depsafe ($DEPSAFE_IMAGE) [$_i: ${_f#/src/}] ..." >&2
+        docker run --rm -i \
+          -v "$target:/src:ro" \
+          "$DEPSAFE_IMAGE" --json --no-color "$_f" \
+          > "$outdir/$TS-depsafe-$_i.json" 2>"$outdir/.depsafe-$_i.log" || true
+      done
+      run_python "$outdir" "$TS" <<'PYEOF'
+import json, glob, os, sys
+outdir, ts = sys.argv[1], sys.argv[2]
+files = sorted(glob.glob(os.path.join(outdir, ts + "-depsafe-*.json")))
+merged = {"findings": [], "severity_counts": {}}
+n = 0
+for p in files:
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    n += 1
+    for fnd in d.get("findings") or []:
+        merged["findings"].append(fnd)
+    for k, v in (d.get("severity_counts") or {}).items():
+        merged["severity_counts"][k] = merged["severity_counts"].get(k, 0) + v
+    os.remove(p)
+if n:
+    with open(os.path.join(outdir, ts + "-depsafe.json"), "w") as f:
+        json.dump(merged, f, indent=2)
+    print(f"vuln-scan: [depsafe] merged {n} per-file report(s)", file=sys.stderr)
+PYEOF
+      [ -f "$outdir/$TS-depsafe.json" ] && ok=1
+    else
+      _depsafe_skipped=1
+      echo "vuln-scan: [depsafe] no changed Python dependency files (tier skipped)" >&2
+    fi
+
+    # sloppy-joe: directory-based (manifest auto-detection, no file-list
+    # mode upstream) — run the whole-repo check only when a manifest or
+    # lockfile is in the changed set.
+    _sj_changed=0
+    for _f in $_files; do
+      case "$_f" in
+        */package.json|*/package-lock.json|*/pnpm-lock.yaml|*/yarn.lock|\
+        */requirements*.txt|*/pyproject.toml|*/Pipfile|*/Pipfile.lock|*/uv.lock|\
+        */Cargo.toml|*/Cargo.lock|*/go.mod|*/go.sum|*/Gemfile|*/Gemfile.lock|\
+        */composer.json|*/composer.lock|*.csproj|*/packages.lock.json)
+          _sj_changed=1
+          break
+          ;;
+      esac
+    done
+    _sloppy_skipped=0
+    if [ "$_sj_changed" = 1 ]; then
+      _sj_args="check --json --dir /src --config /config/sloppy-joe-default-config.json --cache-dir /cache"
+      [ "$SLOPSQUAT_ONLINE" = "1" ] && _sj_args="$_sj_args --full"
+      mkdir -p "$RESULTS_ROOT/.cache/sloppy-joe" 2>/dev/null || true
+      scan sloppy-joe "$SLOPPYJOE_IMAGE" sloppy-joe.json "$outdir" \
+        -v "$target:/src:ro" -v "$outdir:/out" \
+        $_sj_overlays \
+        -v "$DIR/../docker:/config:ro" \
+        -v "$RESULTS_ROOT/.cache/sloppy-joe:/cache" \
+        "$SLOPPYJOE_IMAGE" $_sj_args && ok=1
+    else
+      _sloppy_skipped=1
+      echo "vuln-scan: [sloppy-joe] no changed manifest/lockfile (tier skipped)" >&2
+    fi
+
+    [ "$ok" = 1 ] || die "no reports produced (all scanners failed)"
+
+    print_summary "changed $short vs $base_ref ($_n files)" "$outdir" "$_sq_mode" \
+      "$_shellcheck_skipped" "$_depsafe_skipped" "$_sloppy_skipped"
     ;;
 
   build)

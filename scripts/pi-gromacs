@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# pi-gromacs — interactive pi session for GROMACS work on this stack.
+# Runs gromacs-sim / KB audit / KB fix with Hindsight fully inert, so task
+# quality is judged on agent + skill + KB alone (no memory confounder).
+# Pins the iGPU Qwen3.6 model (the eGPU is busy running GROMACS itself).
+#
+# vs. plain `pi`:
+#   --model igpu-Qwen3.6-35B-A3B    -> iGPU Qwen3.6 (not the eGPU default)
+#   --system-prompt <persona file>  -> replaces the default prompt with the
+#                                      gromacs-md persona (was the pi-subagents
+#                                      agent's systemPromptMode: replace)
+#   --thinking high                 -> matches the old agent's thinking: high
+#   --exclude-tools 'hindsight_*'   -> removes all 8 hindsight_* tools
+#   HINDSIGHT_DISABLE_HOOKS=1       -> disables auto-injection, write-back,
+#                                      seed, idle-retain for this session
+# Net: no hindsight tools, no injected memory, no persistence for this
+# session. Every other session (plain `pi`) is completely unaffected.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"   # repo root, so project .pi/skills are discovered
+
+export HINDSIGHT_DISABLE_HOOKS=1
+exec pi \
+  --model "igpu-Qwen3.6-35B-A3B" \
+  --system-prompt "$REPO_ROOT/.pi/gromacs-md-system.md" \
+  --thinking high \
+  --exclude-tools 'hindsight_*' \
+  "$@"

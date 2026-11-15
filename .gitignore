@@ -1,7 +1,14 @@
 # =============================================================================
-# open-webui — entire runtime data directory (DB, cache, uploads, embeddings)
+# open-webui — runtime data directory (DB, cache, uploads, embeddings);
+# README.md is tracked
 # =============================================================================
-open-webui/
+open-webui/*
+!open-webui/README.md
+
+# =============================================================================
+# Hindsight — runtime memory data (Postgres/pg0 bind mount); README.md is tracked
+# =============================================================================
+hindsight/data/
 
 # =============================================================================
 # llama-cpp — model files (large binaries, managed outside git)

@@ -33,7 +33,7 @@ def _mk_resource(active_files=(), review_files=(), review_tag="review-by-ai"):
     """Build a fake board resource tree (lanes -> files with content)."""
     return [
         {"name": "Active",
-         "files": [{"name": n, "content": f"[tag:genai_stack]\n\n# {n}\n"} for n in active_files]},
+         "files": [{"name": n, "content": f"\n# {n}\n"} for n in active_files]},
         {"name": "Ready", "files": []},
         {"name": "OnHold", "files": []},
         {"name": "Review",

@@ -25,7 +25,7 @@ RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.lis
 
 # Pinned release tag — change ARG to upgrade
 # Releases: https://github.com/gromacs/gromacs/releases
-ARG GROMACS_VERSION=v2026.3
+ARG GROMACS_VERSION=v2026.4
 RUN git clone --depth 1 --branch ${GROMACS_VERSION} \
     https://github.com/gromacs/gromacs.git /gromacs
 

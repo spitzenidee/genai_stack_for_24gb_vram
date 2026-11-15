@@ -132,6 +132,56 @@ services:
       --metrics
     restart: unless-stopped
 
+  # Hindsight (vectorize-io) — persistent memory server for the AI agents
+  # (retain / recall / reflect). Always-on (no profile): memory must persist
+  # across GPU work-modes, and the iGPU it depends on is always-on. Pure HTTP
+  # client — it never kills/restarts the llama servers. LLM pinned to the iGPU
+  # slot exclusively (OpenAI-compatible; the API key is unused by llama.cpp).
+  # Concurrency capped at 1 per operation because the iGPU is single-slot per
+  # model (parallel = 2 KV slots on the same model -> no swap/unload/cancel).
+  # Docs: ${APP_ROOT}/hindsight/README.md
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:1.2.1
+    container_name: hindsight
+    depends_on:
+      - llamacpp-igpu
+    ports:
+      - "8888:8888"    # API
+      - "9999:9999"    # control-plane UI
+    volumes:
+      - ${APP_ROOT}/hindsight/data:/home/hindsight/.pg0
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      # LLM -> iGPU slot exclusively (OpenAI-compatible; key unused by llama.cpp)
+      - HINDSIGHT_API_LLM_PROVIDER=openai
+      - HINDSIGHT_API_LLM_BASE_URL=http://llamacpp-igpu:8093/v1
+      - HINDSIGHT_API_LLM_MODEL=${LLAMA_IGPU_MODEL}
+      - HINDSIGHT_API_LLM_API_KEY=not-needed
+      - HINDSIGHT_API_LLM_REASONING_EFFORT=medium    # user decision 2026-10-20: monitored experiment — medium effort (quality-before-latency relaxed)
+      # iGPU is single-slot per model -> cap concurrency
+      - HINDSIGHT_API_LLM_MAX_CONCURRENT=1
+      - HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT=1
+      - HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT=1
+      # Timeouts: sized for iGPU Qwen3.6 at reasoning_effort=high, which took >5 min per call
+      # (observed 5024-token generation in 312 s) — defaults (120 s LLM / 30 s reflect) were too small.
+      # (2026-11-03: back on Qwen3.6 after the LFM2.5 R5 dry-run fail — these are the original tight fits again.)
+      - HINDSIGHT_API_LLM_TIMEOUT=900
+      - HINDSIGHT_API_REFLECT_LLM_TIMEOUT=900
+      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=7200
+      # Retain wall timeout: the 3600 s default killed queued retain ops (wall clock counts
+      # from task creation incl. queue wait; session-end retains pile up behind 2–57 min LLM
+      # calls on the single LLM slot) — 4 retains lost 19.10 22:27–23:04. User decision 2026-10-20.
+      - HINDSIGHT_API_RETAIN_WALL_TIMEOUT=7200
+      # Startup init cap: the startup LLM verification call queues behind active iGPU
+      # work (single slot); default 300 s made the container crash-loop while the iGPU was busy
+      - HINDSIGHT_API_MODEL_INIT_TIMEOUT=7200
+      - HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES=1
+      - HINDSIGHT_API_WORKER_ID=hindsight             # stable worker identity
+      # local CPU embedder + reranker (no extra LLM)
+      - HINDSIGHT_API_EMBEDDINGS_PROVIDER=local
+      - HINDSIGHT_API_RERANKER_PROVIDER=local
+    restart: unless-stopped
+
   # AMD GPU sysfs Prometheus exporter — pure stdlib Python, no ROCm.
   # Reads /sys/class/drm and /sys/class/hwmon from the container's sysfs view
   # (already accessible; no extra mounts needed — containers share the VM kernel's sysfs).
@@ -170,7 +220,7 @@ services:
   otel-collector:
     # NOTE: gpu-exporter omitted from depends_on intentionally — OTel handles
     # a temporarily unavailable scrape target gracefully without blocking startup.
-    image: otel/opentelemetry-collector-contrib:0.158.0
+    image: otel/opentelemetry-collector-contrib:0.165.0
     container_name: otel-collector
     hostname: genaivm   # prevent container ID from appearing as host.name in Grafana
     environment:
@@ -195,7 +245,7 @@ services:
       - llama-sd
 
   lact:
-    image: ghcr.io/ilya-zlobintsev/lact:v0.9.0    # official image: daemon + CLI only (no GUI)
+    image: ghcr.io/ilya-zlobintsev/lact:v0.10.1    # official image: daemon + CLI only (no GUI)
     container_name: lact
     privileged: true                              # required: sysfs writes for power/voltage control
     devices:

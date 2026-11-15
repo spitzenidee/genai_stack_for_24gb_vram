@@ -21,7 +21,7 @@ RUN rm -f /etc/apt/sources.list.d/amdgpu*.list /etc/apt/sources.list.d/rocm*.lis
     libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
-ARG BLENDER_VERSION=5.2.0
+ARG BLENDER_VERSION=5.2.4
 ARG BLENDER_URL=https://download.blender.org/release/Blender5.2/blender-${BLENDER_VERSION}-linux-x64.tar.xz
 
 RUN mkdir -p /opt/blender && \

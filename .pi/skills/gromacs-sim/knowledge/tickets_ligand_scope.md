@@ -27,7 +27,7 @@ external sources; no known defects propagated.
 
 - **Status**: [ ] OPEN (proposal — awaiting finetuning)
 - **Target**:
-  - `.pi/agents/gromacs-md.md` (Tier C → ligand in scope; Tier A ligand questions)
+  - `.pi/gromacs-md-system.md` (Tier C → ligand in scope; Tier A ligand questions)
   - `.pi/skills/gromacs-sim/` (new ligand runbook + gate; phase 5/6 surgery)
   - `.pi/skills/gromacs-sim/knowledge/` (`00.6`, `01.3`, `01.5`, `02.02`, `03.2`)
   - `gromacs/Dockerfile.mdprep` (v1.1 tooling — see open question D2)
@@ -46,7 +46,7 @@ metrics — instead of being told "ligand parameterization is out of scope".
 
 ### Why this is a gap (evidence, 2026-07-24)
 
-- **Agent** (`.pi/agents/gromacs-md.md`, Tier C): "out of scope: new force
+- **Agent** (`.pi/gromacs-md-system.md`, Tier C): "out of scope: new force
   fields, **ligand parameterization**, membrane systems → refuse and say why."
 - **Skill**: no ligand phase, no ligand gate, no ligand posre, no ligand
   `tc-grps` handling. Phase 2 (`02-topology.md`) is protein-only.

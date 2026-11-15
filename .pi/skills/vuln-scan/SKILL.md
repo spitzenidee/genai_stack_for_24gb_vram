@@ -2,26 +2,33 @@
 name: vuln-scan
 description: >
   Vulnerability scanning for the stack (review phase, tag-triggered).
-  Dockerized Trivy (SCA: deps + OS packages + docker images + secrets),
-  Semgrep CE (SAST: python/javascript/typescript), and a slopsquatting tier
-  (depsafe + sloppy-joe: typosquatting / AI-hallucinated package names) in
-  transient containers (tmd pattern). Use when a board card is tagged
-  `vuln-scan`, when the reviewer runs the scan phase, or for an optional
-  implementer self-check. `vuln-scan repo <path>` scans a repo; `vuln-scan
-  image <name>` scans a local docker image; `vuln-scan build` builds the
-  local scanner images.
+  Dockerized Trivy (SCA: deps + OS packages + docker images + secrets +
+  Dockerfile misconfig), Semgrep CE (SAST: python/javascript/typescript/
+  java/rust/dockerfile + in-skill docker-compose ruleset), ShellCheck
+  (shell SAST), and a slopsquatting tier (depsafe + sloppy-joe:
+  typosquatting / AI-hallucinated package names) in transient containers
+  (tmd pattern). Use when a board card is tagged `vuln-scan`, when the
+  reviewer runs the scan phase, or for an optional implementer self-check.
+  `vuln-scan repo <path>` scans a repo; `vuln-scan changed <path>
+  [base-ref]` scans only git-changed paths; `vuln-scan image <name>` scans
+  a local docker image; `vuln-scan build` builds the local scanner images.
 ---
 
 # vuln-scan
 
-Vulnerability scanning as a **review phase**: three tiers with disjoint
+Vulnerability scanning as a **review phase**: four tiers with disjoint
 coverage, run in transient docker containers (same pattern as the `tmd`
 wrapper — sh + docker, no host deps).
 
 - **Trivy** — SCA: dependency vulnerabilities (lock files), OS packages,
-  docker images, and hard-coded secrets.
+  docker images, hard-coded secrets, and Dockerfile misconfigurations
+  (`misconfig` scanner; no docker-compose support upstream — compose is
+  covered by the in-skill Semgrep ruleset).
 - **Semgrep CE** — SAST: source-code patterns for python / javascript /
-  typescript (explicit registry rulesets).
+  typescript / java / rust / dockerfile (explicit registry rulesets) + an
+  in-skill YAML ruleset for docker-compose misconfiguration.
+- **ShellCheck** — SAST for shell scripts (the Semgrep Registry has no
+  `p/bash` ruleset — `p/bash`/`p/shell` are 404).
 - **Slopsquatting tier** — dependency *name* checks (the blind spot of both
   SCA and SAST: a squatted package with no known CVE passes Trivy clean):
   - **depsafe** — Python-only: typosquatting / slopsquatting / homoglyph /
@@ -37,14 +44,22 @@ redundant with Trivy and are **not** part of this tool.
 ## Usage
 
 ```sh
-.pi/skills/vuln-scan/scripts/vuln-scan.sh repo <path>     # common case: all tiers
-.pi/skills/vuln-scan/scripts/vuln-scan.sh image <name>    # opt-in: local docker image
-.pi/skills/vuln-scan/scripts/vuln-scan.sh build           # build the local scanner images
+.pi/skills/vuln-scan/scripts/vuln-scan.sh repo <path>              # common case: all tiers
+.pi/skills/vuln-scan/scripts/vuln-scan.sh changed <path> [base]    # git-changed paths only
+.pi/skills/vuln-scan/scripts/vuln-scan.sh image <name>             # opt-in: local docker image
+.pi/skills/vuln-scan/scripts/vuln-scan.sh build                    # build the local scanner images
 ```
 
-- `repo <path>` — runs **Trivy fs** (vuln + secret, MEDIUM+), **Semgrep**
-  (explicit rulesets), **depsafe** and **sloppy-joe** over the repo at
-  `<path>`.
+- `repo <path>` — runs **Trivy fs** (vuln + secret + misconfig, MEDIUM+),
+  **Semgrep** (explicit rulesets + in-skill compose ruleset),
+  **ShellCheck** (shell scripts), **depsafe** and **sloppy-joe** over the
+  repo at `<path>`.
+- `changed <path> [base-ref]` — scans only the git-changed paths of the
+  repo at `<path>` (vs `base-ref`, default `HEAD`): tracked files differing
+  from the base (staged + unstaged) plus untracked non-ignored files;
+  deletions are dropped. Runs the same tiers restricted to the changed
+  files (a tier with no applicable changed file is skipped and noted).
+  Non-git path → clear error.
 - `image <name>` — runs **Trivy image** on a local docker image (via
   `docker.sock`). Only when a card touched a Dockerfile / built an image.
 - `build` — builds the two local slopsquatting images from
@@ -59,14 +74,15 @@ redundant with Trivy and are **not** part of this tool.
   `<repo-short-name>` = basename of the scanned path. `work/*` is already
   gitignored — results are **never committed**. Override the root with
   `VULN_SCAN_RESULTS_DIR` (env var or `vuln-scan.env`, see Config).
-  A repo scan produces up to four reports: `-trivy.json`, `-semgrep.json`,
-  `-depsafe.json`, `-sloppy-joe.json`.
+  A repo scan produces up to five reports: `-trivy.json`, `-semgrep.json`,
+  `-shellcheck.json`, `-depsafe.json`, `-sloppy-joe.json`.
 - **Summary → stdout**: count by severity (CRITICAL/HIGH/MEDIUM/LOW) +
   findings (ID, severity, title, file:line, capped at 40) so the reviewer
   can triage without reading the raw JSON.
 - Severity mapping for the summary: Semgrep INFO→LOW, WARNING→MEDIUM,
-  ERROR→HIGH; sloppy-joe Error→HIGH, Warning→MEDIUM; depsafe severities are
-  used as-is (critical/high/medium/low/info).
+  ERROR→HIGH; ShellCheck info→LOW, warning→MEDIUM, error→HIGH;
+  sloppy-joe Error→HIGH, Warning→MEDIUM; depsafe severities are used as-is
+  (critical/high/medium/low/info).
 
 ## Config
 
@@ -77,11 +93,12 @@ upgrade).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `VULN_SCAN_TRIVY_IMAGE` | `aquasec/trivy:0.76.0` | Pinned Trivy image |
-| `VULN_SCAN_SEMGREP_IMAGE` | `semgrep/semgrep:1.180.0` | Pinned Semgrep image |
-| `VULN_SCAN_TRIVY_SCANNERS` | `vuln,secret` | Trivy fs scanners (repo scan) |
+| `VULN_SCAN_TRIVY_IMAGE` | `aquasec/trivy:0.76.2` | Pinned Trivy image |
+| `VULN_SCAN_SEMGREP_IMAGE` | `semgrep/semgrep:1.183.0` | Pinned Semgrep image |
+| `VULN_SCAN_TRIVY_SCANNERS` | `vuln,secret,misconfig` | Trivy fs scanners (repo scan; `misconfig` = Dockerfile/k8s/terraform — no compose upstream) |
 | `VULN_SCAN_TRIVY_SEVERITY` | `MEDIUM,HIGH,CRITICAL` | Minimum severity (repo + image scans) |
-| `VULN_SCAN_SEMGREP_RULESETS` | `p/python,p/javascript,p/typescript` | Comma-separated; expanded to one `--config` per entry |
+| `VULN_SCAN_SEMGREP_RULESETS` | `p/python,p/javascript,p/typescript,p/java,p/rust,p/dockerfile` | Comma-separated; expanded to one `--config` per entry. The in-skill compose ruleset (`semgrep-compose.yaml`) is always added on top — it is not a registry ruleset |
+| `VULN_SCAN_SHELLCHECK_IMAGE` | `koalaman/shellcheck-alpine:v0.11.0` | Pinned ShellCheck image |
 | `VULN_SCAN_SKIP_DIRS` | `.git,work,_dl,hfmodels,models,node_modules,__pycache__,.venv,venv,dist,build` | Directory names skipped by both scanners |
 | `VULN_SCAN_RESULTS_DIR` | *(empty)* | Results root; empty = `$STACK_ROOT/work/vuln_scan_results` |
 | `VULN_SCAN_SUMMARY_LIMIT` | `40` | Max findings listed per report in the stdout summary |
@@ -103,10 +120,14 @@ sloppy-joe config mounted from the skill dir (never from the scanned repo).
 - The **implementer** adds the `vuln-scan` tag on line 1 when the change
   touches code/containers/scripts (completion-checklist item). The tag is
   **appended** to the existing tag line — never replaces pre-existing tags
-  (`[tag:security]` → `[tag:security] [tag:vuln-scan]`).
+  (line 1 may be empty: `` → `[tag:vuln-scan]`,
+  `[tag:research]` → `[tag:research][tag:vuln-scan]`).
 - The **reviewer** runs the scan at the start of review when the tag is
-  present **or** judges it warranted (safety net). Pure
-  spec/content/GROMACS/Blender cards → no tag → no scan.
+  present **or** judges it warranted (safety net). Cards that touch no code,
+  containers, scripts, or dependencies → no scan (regardless of project
+  type). The `vuln-scan` tag is the primary trigger; the reviewer's judgment
+  is a safety net only for code-touching cards where the tag is missing — it
+  must not fire on pure spec/content/docs cards.
 - **Reviewer-only** is the canonical/gating scan. The implementer may use
   the tool for an optional shift-left self-check, but it is not part of the
   completion criteria.
@@ -136,7 +157,7 @@ tools (no in-house checker), each in its own transient container.
 ### sloppy-joe (8 ecosystems, offline `check`)
 
 - Upstream: `brennhill/sloppy-joe` (Apache-2.0, Rust single static musl
-  binary, v1.1.0 — pinned in `docker/sloppy-joe.Dockerfile` via `ARG`
+  binary, v2.1.0 — pinned in `docker/sloppy-joe.Dockerfile` via `ARG`
   VERSION + per-arch sha256; prebuilt release binary, no build step).
 - Ecosystems: npm/pnpm/Yarn/Bun, Python, Rust, Go, Ruby, PHP, JVM, .NET.
 - **`check` (default, offline):** manifest parsing, lockfile presence +
@@ -165,9 +186,11 @@ tools (no in-house checker), each in its own transient container.
 
 - Every trivy invocation carries `--disable-telemetry --skip-version-check`.
 - Every semgrep invocation carries `--metrics off` and uses **explicit
-  rulesets** (`--config p/python --config p/javascript --config p/typescript`)
-  — never `--config auto` (which sends languages/frameworks/project-URL to
-  the Semgrep Registry).
+  rulesets** (`--config p/python … --config p/dockerfile`) plus the in-skill
+  compose ruleset file mounted `:ro` — never `--config auto` (which sends
+  languages/frameworks/project-URL to the Semgrep Registry).
+- ShellCheck runs in a transient container with a `:ro` source mount; the
+  only outbound traffic is the registry pull of the pinned image.
 - **Slopsquatting tier is offline by default** (`VULN_SCAN_SLOPSQUAT_ONLINE=0`):
   depsafe uses its built-in corpus, sloppy-joe runs the fast local guardrail
   — no outbound traffic. Online mode (=1) sends only package *names* to the
@@ -178,17 +201,19 @@ tools (no in-house checker), each in its own transient container.
 
 ## Pinned scanner images
 
-- `aquasec/trivy:0.76.0` (registry pull)
-- `semgrep/semgrep:1.180.0` (registry pull)
+- `aquasec/trivy:0.76.2` (registry pull)
+- `semgrep/semgrep:1.183.0` (registry pull)
+- `koalaman/shellcheck-alpine:v0.11.0` (registry pull)
 - `vuln-scan-depsafe:local` (local build: `docker/depsafe.Dockerfile`,
   depsafe v0.1.0 @ 067b09d, vendored)
 - `vuln-scan-sloppy-joe:local` (local build: `docker/sloppy-joe.Dockerfile`,
-  sloppy-joe v1.1.0 @ 3d9d413, prebuilt release binary, sha256-pinned)
+  sloppy-joe v2.1.0 @ 62dfead, prebuilt release binary, sha256-pinned)
 
 Registry images are pulled on demand if not present; local images are built
 on demand (or via `vuln-scan build`) if not present. The pins live in
 `vuln-scan.env` (`VULN_SCAN_TRIVY_IMAGE` / `VULN_SCAN_SEMGREP_IMAGE` /
-`VULN_SCAN_DEPSAFE_IMAGE` / `VULN_SCAN_SLOPPYJOE_IMAGE`) and in the
+`VULN_SCAN_SHELLCHECK_IMAGE` / `VULN_SCAN_DEPSAFE_IMAGE` /
+`VULN_SCAN_SLOPPYJOE_IMAGE`) and in the
 Dockerfiles (upstream version + checksums) — bump them there, not in the
 script, and note the new versions in the board card Log.
 
@@ -198,14 +223,35 @@ script, and note the new versions in the board card Log.
   non-zero scanner exit does not abort the run. Whatever JSON was produced
   is kept and summarized; the wrapper exits 1 only if **no** report was
   produced. The AI sees all findings and judges them.
-- **Skip list**: both scanners skip directory *names* in
+- **Skip list**: all file-based tiers skip directory *names* in
   `.git,work,_dl,hfmodels,models,node_modules,__pycache__,.venv,venv,dist,build`
   (heavy data / build artifacts, not code — the stack root is ~116G of
   models). Override with `VULN_SCAN_SKIP_DIRS` (comma-separated names; env
   var or `vuln-scan.env`).
-- **Bash coverage gap**: the Semgrep Registry has no `p/bash` ruleset
-  (verified 14.10.2026: `p/bash` and `p/shell` both 404). Shell scripts are
-  covered by Trivy's secret scanner only; SAST for bash is out of scope V1.
+- **Shell SAST (ShellCheck)**: the Semgrep Registry has no `p/bash`
+  ruleset (verified 14.10.2026: `p/bash` and `p/shell` both 404), so shell
+  scripts are checked by **ShellCheck** in its own transient container
+  (pinned `koalaman/shellcheck-alpine:v0.11.0`). File list = `*.sh`/`*.bash`
+  under the target with skip dirs respected; no shell files → tier skipped
+  (informational, not a failure). Severity mapping: info→LOW, warning→MEDIUM,
+  error→HIGH.
+- **Docker-compose SAST (in-skill ruleset)**: neither the Semgrep Registry
+  nor Trivy covers docker-compose (trivy `misconfig` supports Dockerfile but
+  not compose — aquasecurity/trivy#8729). The in-skill ruleset
+  `semgrep-compose.yaml` (rules: `privileged: true`, root user,
+  `network_mode: host`, exposed privileged ports, missing `read_only`,
+  missing resource limits, missing healthcheck) is mounted `:ro` into the
+  semgrep container (same pattern as the sloppy-joe config mount — never
+  from the scanned repo) and added as an explicit `--config` on top of the
+  registry rulesets.
+- **Changed mode semantics** (`vuln-scan changed <path> [base-ref]`): the
+  changed set = `git diff --name-only <base-ref>` (staged + unstaged vs the
+  base; default `HEAD`) + `git ls-files --others --exclude-standard`
+  (untracked, non-ignored); deletions are dropped (file no longer on disk),
+  skip dirs respected. Tiers receive explicit file lists; a tier with no
+  applicable changed file is skipped and noted in the summary. Trivy `fs`
+  accepts a single target, so multiple changed files run per-file with the
+  JSON reports merged. Non-git path → clear error (exit 2).
 - **Slopsquatting coverage nuance**: sloppy-joe's *similarity* detection
   (mutation candidates checked against the registry) is part of the online
   `--full` tier — the offline `check` covers provenance/lockfile/sync +
@@ -216,12 +262,17 @@ script, and note the new versions in the board card Log.
   in its report — noise the reviewer can ignore. sloppy-joe auto-detects
   manifests recursively (package.json / requirements.txt / pyproject.toml /
   …); a repo with no manifest yields no sloppy-joe report (non-fatal).
-- **sloppy-joe known failure mode**: a *broken* venv symlink (e.g.
-  `work/yt-commenter-stats/.venv/bin/python` → container-only
-  `/usr/local/bin/python`) makes sloppy-joe exit 2 (runtime error, no
-  report) when it resolves the Python environment. Non-fatal (the run
-  continues with the other tiers); fix by removing the stale venv. No
-  skip-dirs flag exists upstream.
+- **sloppy-joe skip-dirs (host venvs)**: sloppy-joe has no skip-dirs flag
+  upstream — it mounts the whole repo at `/src` and resolves the Python
+  environment as part of `check`. A host venv (e.g. `.venv`) has a
+  `bin/python3` symlink that is broken from the container's view (the image
+  is a Rust static binary with no host Python), which made sloppy-joe exit 2
+  with no report — a silent loss of the tier. The wrapper now hides every
+  `VULN_SCAN_SKIP_DIRS` path that exists in the target by mounting an empty
+  dir over it under `/src` (reuses the existing `SKIP_DIRS` config), so
+  sloppy-joe never sees a host venv. As a safety net, any expected tier that
+  produces no report is named loudly in the summary (`WARNING: no <tool>
+  report produced …`) — a dropped scanner is never silent.
 - **sloppy-joe lockfile behavior** (verified 16.10.2026):
   - *Missing lockfile* (manifest present, no lockfile): sloppy-joe exits 2
     with **no** JSON report — a hard fail, because it cannot run

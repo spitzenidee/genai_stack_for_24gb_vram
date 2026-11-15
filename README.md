@@ -53,17 +53,9 @@ I chose a budget limit of 2000€ so "nearly anyone" (yes, I'm aware this is als
 
 This gives me a lump sum of my setup of approximately **1650€**, so well within my limit.
 
-## Why GROMACS and BLENDER, then?
+### Why GROMACS and BLENDER, then?
 
 Because both benefit vastly from GPU acceleration and I always wanted to test the waters of (algorithmic) 3D rendering and refresh some fun experiments in molecular dynamics simulations, which I worked on during my diploma thesis (see [RuBisCO](https://en.wikipedia.org/wiki/RuBisCO)) and continued for fun during my PhD for a bit.
-
-## Disclaimer
-
-> **This stack, and therefore also this README, have been conceived, implemented and written with significant usage of LLMs (e.g. Github CoPilot).**
-
-> In parts, you can expect the percentage to be 90% implementation by AI, with 90% steering and specification done by a human (me). In other parts, this may change to 100% implementation by AI and only 50% steering by me, because during spec and finetuning with AI I let it loose when I suspected it's intended direction fit my own needs and hardware (e.g. OTel instrumentation via the `llama-sd` component, or `lact`). I let AI write the scaffolding of the README and other docs based on hard factual knowledge extracted from the codebase, let it integrate todos and pointers for me to fill in with my own intentions, information, goals etc, and the result is the README you are currently reading. It's a mixture of purely human-written parts, mixed together with parts written 80-100% by AI.
-
-> Also, this stack and repo are in a state of slow, yet steady, flow - it cannot be considered stable, easy to setup and following a strict release cycle yet (and probably for all eternity). This repo is deliberately experimental and supports my own hardware and use cases as optimal as possible. It is not something that applies on a generalistic scale.
 
 ## Use Cases I wanted to try and establish
 
@@ -79,7 +71,16 @@ Because both benefit vastly from GPU acceleration and I always wanted to test th
 - Push power saving limits, especially in idle, to not waste energy, CO2 and my money.
 - Run local coding agents (I chose [pi.dev](https://pi.dev/) for now, because it's lean and easy on context)
 
-## Architecture Overview
+## Strategy & manifest
+
+The choices below are the "how" that follows from the mission statement. Together they make the stack one opinionated whole rather than a collection of independent projects.
+
+- **One stack, one entrypoint.** A single `docker-compose.yml` driven by a thin `make` wrapper — not a separate compose file per workload. `make <mode>` stops the current mode's heavy VRAM contenders and starts the target one, leaving every always-on service untouched. I chose this single-switch pattern over externalizing each mode into its own stack compartment because one comprehensible definition of the whole stack is more transparent (to my own brain, that is) than any externalization and modularization of the very definition of the stack. So far it works very reliably.
+- **Always-on vs mode services.** Two classes: *always-on* (every mode) — `lact`, `gpu-exporter`, `otel-collector`, `llama-sd`, `llamacpp-igpu` — and *mode-exclusive* (one at a time on the eGPU) — `llama`, `comfyui`, `gromacs`, `blender`. The iGPU service runs on separate hardware (the Radeon 780M) and never contends for eGPU VRAM, so it is always-on. The tables are in [Architecture overview](#architecture-overview) below.
+- **GPU access via DRI passthrough.** Containers get the GPUs through bind-mounted DRI render nodes (`/dev/dri/`) and bring their own ROCm/Vulkan user space — no host ROCm install. The VFIO passthrough setup itself is documented in the companion repository linked above.
+- **Budget as the guiding constraint.** The whole build is capped at ~2000€ so "nearly anyone" could at least try and repeat it; the per-component prices are in the mission statement above. Second-hand where sensible.
+
+## Architecture overview
 
 ```mermaid
 flowchart LR
@@ -110,17 +111,10 @@ flowchart LR
 
 All GPU access goes through bind-mounted DRI render nodes (`/dev/dri/`); the
 containers bring their own ROCm/Vulkan user space, so no ROCm installation is
-required on the host.
+required on the host. The VFIO passthrough setup is documented in the companion
+repository linked in the introduction.
 
-## Prerequisites
-
-- Docker Engine with the Compose plugin.
-- `make` (thin wrapper around `docker compose`; see the `Makefile`).
-- Host `amdgpu` kernel driver with both GPUs visible under `/dev/dri/`
-  (VFIO passthrough setup is documented in the companion repo linked above).
-- Host group IDs for GPU access (`render`, `video`) — see Configuration.
-
-## GPU work modes
+### GPU work modes
 
 The RX 7900 XTX exposes a single VRAM address space to all ROCm/Vulkan
 compute clients. Running two heavy GPU workloads simultaneously (likely) causes OOM
@@ -155,9 +149,7 @@ make blender    # switch to Blender mode
 make status     # container state table
 ```
 
-I chose to manage eGPU work modes via this single-switch pattern based on `make` (instead of e.g. setting up separate stack compartments via separate docker-compose files) because I liked the idea to have a single stack, and individual components of this stack are switched on and off via a single entrypoint. At least in my mind this was much more transparent and comprehensible (to my own brain, that is) than any externalization and modularization of the very definition of the stack. So far I can say that it works very reliable and takes care of only stopping and starting the heavy VRAM contender services while leaving all always-on services untouched.
-
-## Services and ports
+### Services and ports
 
 | Service          | Port | Mode                | Always on |
 |------------------|------|---------------------|-----------|
@@ -172,7 +164,63 @@ I chose to manage eGPU work modes via this single-switch pattern based on `make`
 | `otel-collector` | 4318 | all                 | yes       |
 | `lact`           | —    | all                 | yes       |
 
-## Quickstart
+## The board loop ("Ralph looping")
+
+The stack develops itself through a card/board loop — "Ralph looping". A "dumb"
+Python orchestrator (`orchestrator/orchestrator.py`) — **no LLM in the
+scheduling loop** — launches phase-specific worker agents **one at a time** on a
+[tasks.md](tasks.md/README.md) kanban board: a **refiner** (turns free-form cards
+into a canonical spec), an **implementer** (works a card), and a **reviewer**
+(reviews the result). The single eGPU model slot means at most one card is in
+`Active` at a time, so the orchestrator serializes the workers on that slot.
+
+The human stays in the loop **asynchronously** through the board's lanes and keeps
+**full decision power**:
+
+- **Card content** — the human writes and edits cards; the spec is never rewritten by an agent.
+- **Sign-off** — `Review → Done` is the human's checkpoint; no card is "done" until the human approves it.
+- **Flow** — lane moves and in-lane order (top = highest priority) are the human's to control; the human is the *unblocker* for `AskUser` and `OnHold` cards.
+
+The lanes that carry the asynchronous handover: `Ready` (human → AI), `Active`
+(one card at a time), `Review` (AI → human), `Done` (human-approved), plus the
+handover lanes `Spec` (human → AI → human), `AskUser` (AI → human → AI) and
+`OnHold` (waiting on a condition).
+
+The board protocol (lanes, card format, the `tmd` CLI, user interaction) lives in
+[tasks.md/README.md](tasks.md/README.md); the orchestrator (single slot, worker
+roles, timers, crash behavior) lives in
+[orchestrator/README.md](orchestrator/README.md). The agent-facing hard rules for
+this repository are in [`AGENTS.md`](AGENTS.md).
+
+## Component index
+
+| Component | README | What it covers |
+|-----------|--------|----------------|
+| Inference (llama.cpp) | [llamacpp/README.md](llamacpp/README.md) | eGPU ROCm + iGPU Vulkan builds, models, API, model download |
+| Chat frontend (Open WebUI) | [open-webui/README.md](open-webui/README.md) | chat UI + endpoint configuration |
+| ComfyUI | [comfyui/README.md](comfyui/README.md) | image generation (ROCm/HIP) work mode |
+| Blender | [blender/README.md](blender/README.md) | 3D rendering (Cycles/HIP) work mode |
+| GROMACS | [gromacs/README.md](gromacs/README.md) | molecular dynamics (ROCm/HIP) work mode |
+| Observability (OpenTelemetry) | [otel/README.md](otel/README.md) | gpu-exporter, llama-sd, otel-collector, host monitor |
+| Grafana | [grafana/README.md](grafana/README.md) | dashboards + standalone LGTM backend |
+| GPU tuning (LACT) | [lact/README.md](lact/README.md) | voltage / fan / power-cap daemon |
+| Task board (tasks.md) | [tasks.md/README.md](tasks.md/README.md) | the board, lanes, card format, `tmd` CLI, user interaction |
+| Board orchestrator | [orchestrator/README.md](orchestrator/README.md) | the "dumb" Python loop that drives the board |
+| Utility scripts | [scripts/README.md](scripts/README.md) | gpu_monitor, benchmarks, mode switching, wrappers |
+| Agent skills | [.pi/README.md](.pi/README.md) | the `.pi/skills/` index (board, GROMACS, vuln-scan, …) |
+| Hindsight memory | [hindsight/README.md](hindsight/README.md) | the repository's memory + knowledge base |
+
+## Getting started
+
+### Prerequisites
+
+- Docker Engine with the Compose plugin.
+- `make` (thin wrapper around `docker compose`; see the `Makefile`).
+- Host `amdgpu` kernel driver with both GPUs visible under `/dev/dri/`
+  (VFIO passthrough setup is documented in the companion repo linked above).
+- Host group IDs for GPU access (`render`, `video`) — see Configuration.
+
+### Quickstart
 
 ```bash
 git clone <repo>
@@ -200,7 +248,7 @@ For a more interactive test I recommend the `llama` mode to be activated via `ma
 
 **Note:** `docker compose build` alone does not refresh the llama.cpp version in
 the eGPU image — the ROCm compile lives in the separate
-`llama-rocm-builder:latest` image (see Inference → Build). Use the
+`llama-rocm-builder:latest` image (see [llamacpp/README.md](llamacpp/README.md) → Build). Use the
 `rebuild-genai-llama` shell alias to rebuild builder + both llama services in
 the correct order:
 
@@ -213,357 +261,7 @@ alias rebuild-genai-llama="
 "
 ```
 
-## Download a model from Huggingface and move to the model folder
-
-`hf_download.sh` is a small resumable download helper for GGUF weights: it
-runs `wget --continue` in the background via `nohup`, so the download
-survives closing the SSH session, and interrupted transfers resume where
-they left off.
-
-```bash
-./hf_download.sh <huggingface_resolve_url> [target_dir]
-```
-
-If no target directory is given, files land in `_dl/` (a staging area; the
-script writes a `_download.log` and `.pid` file next to each download so
-you can monitor with `tail -f` or cancel via `kill $(cat <name>.pid)`).
-
-After the download completes, move the `.gguf` file into
-`llamacpp/hfmodels/` — that directory is bind-mounted to `/models` in both
-`llamacpp-egpu` and `llamacpp-igpu`, so the weights are visible to both
-servers. To actually serve the model, add a `[ModelName]` section for it in
-`llamacpp/models-egpu.ini` and/or `llamacpp/models-igpu.ini` (see
-Configuration under Inference) and restart the corresponding service. by 
-adding a specific LLM to the egpu / igpu `models.ini` variant you can control 
-which model is available in which llama.cpp instance. Only LLMs configured in 
-either `models-egpu.ini` or `models-igpu.ini` will be available, all others 
-will not be exposed.
-
-## Inference: llama.cpp (ROCm eGPU / Vulkan iGPU)
-
-Two `llama-server` instances serve models independently:
-
-| Service          | GPU   | Backend | Image build                                        | Port |
-|------------------|-------|---------|----------------------------------------------------|------|
-| `llamacpp-egpu`  | eGPU  | ROCm/HIP | `llamacpp/Dockerfile.rocm` on `Dockerfile.rocm-builder` | 8092 |
-| `llamacpp-igpu`  | iGPU  | Vulkan/RADV | `llamacpp/Dockerfile.vulkan`                    | 8093 |
-
-### Build: eGPU (`Dockerfile.rocm-builder` + `Dockerfile.rocm`)
-
-The eGPU build is split into two stages to keep iteration fast:
-
-- `Dockerfile.rocm-builder` — the expensive stage (~20+ min): base
-  `rocm/dev-ubuntu-24.04:7.14.1-full`, clones the latest tagged llama.cpp
-  release, compiles with `GGML_HIP=ON` for `AMDGPU_TARGETS=gfx1100`
-  (Navi 31 / RX 7900 XTX) with `GGML_HIP_MMQ_MFMA` + `GGML_HIP_GRAPHS`.
-  Rebuild only when llama.cpp should be updated:
-  `docker build --no-cache -f llamacpp/Dockerfile.rocm-builder -t llama-rocm-builder:latest llamacpp`
-- `Dockerfile.rocm` — thin runtime stage on top of the cached builder image
-  (seconds to rebuild).
-
-### Build: iGPU (`Dockerfile.vulkan`)
-
-- Multi-stage Ubuntu 24.04 image.
-- Builds the latest tagged `llama.cpp` release from GitHub.
-- Back end: `GGML_VULKAN=ON` (RADV selects the GPU at runtime via the
-  bind-mounted render node; no arch-specific compile needed).
-- `GGML_NATIVE=OFF` so the binary is portable across host CPUs.
-- Runtime image installs `mesa-vulkan-drivers` and points the loader to
-  `/usr/share/vulkan/icd.d/radeon_icd.json`.
-- The iGPU (Radeon 780M, gfx1103) deliberately stays on Vulkan: ROCm does not
-  officially support gfx1103, and Vulkan handles the UMA carve-out well.
-  The carve-out is a performance target, not a hard limit — weights/KV that
-  spill past it are allocated from the same physical DDR5 system DRAM via
-  GTT. They remain usable; the iGPU already talks to system memory, so there
-  is no separate VRAM bus to fall back from. Performance may still degrade
-  due to allocation/mapping overhead and CPU/VMM contention.
-
-`Dockerfile.cpu` (AVX-512/VNNI CPU-only build) also exists in `llamacpp/` but
-is not wired into any compose profile.
-
-**Note — why the eGPU moved from Vulkan to ROCm (2026-08):** I started with
-llama.cpp on CPU, moved to ROCm, then switched to Vulkan because token
-generation measured ~20% faster at small/medium context sizes and the image
-is vastly smaller. That decision was reversed after Qwen3.6/3.8 models showed
-severe, reproducible corruption on the Vulkan/RADV backend that did not occur
-on ROCm (HIP) or CPU with identical settings: mistyped tokens in tool calls,
-ignored requests, invented tasks, and intermittent GPU hangs
-(`vk::Queue::submit: ErrorDeviceLost`). Relevant upstream issues:
-[ggml-org/llama.cpp#26744](https://github.com/ggml-org/llama.cpp/issues/26744)
-(Vulkan flash-attn coopmat shader lets stale KV cells influence output),
-[#26195](https://github.com/ggml-org/llama.cpp/issues/26195) (Vulkan FA +
-quantized V cache garbles head_dim=256 models — the Qwen3.x family),
-[#24812](https://github.com/ggml-org/llama.cpp/issues/24812) (Qwen on RADV:
-clustered garbage in warm streaming sessions),
-[#23088](https://github.com/ggml-org/llama.cpp/issues/23088) (MTP speculative
-decoding garbled on Vulkan/RADV at ~0.7% acceptance vs 81% on HIP, same GPU),
-[#21446](https://github.com/ggml-org/llama.cpp/issues/21446) (Qwen on Vulkan:
-`ErrorDeviceLost` on RX 7900 XTX). On ROCm, the same Qwen3.8 config runs
-correctly, and with its embedded MTP draft head
-(`spec-type = draft-mtp,ngram-mod`, 80–95% acceptance) reaches 40+ t/s —
-faster than the Vulkan setup ever was. A lact undervolt (`-150 mV`) was
-investigated as a possible cause of the GPU hangs and ruled out.
-
-### Configuration
-
-Production model-configuration files are created from the tracked example
-files in `llamacpp/` and bind-mounted into `/config/models.ini`. The
-examples tune KV-cache quantization, context length, speculative decoding,
-and reasoning budgets.
-
-Models themselves are stored in the bind-mounted weights directory under
-`llamacpp/`.
-
-### Runtime flags
-
-- `--models-preset /config/models.ini` — load configured models.
-- `-cb` — continuous batching.
-- `-b` / `-ub` — batch / micro-batch sizes.
-- `--models-max` — maximum concurrently loaded models.
-- `--metrics` — expose Prometheus metrics.
-
-### API
-
-`llama-server` exposes an OpenAI-compatible chat-completions endpoint at
-`http://<host>:8092/v1/chat/completions` (and `:8093` for the iGPU).
-
-## Chat frontend: `open-webui`
-
-The `open-webui` service runs the upstream container image and connects to
-the eGPU inference backend.
-
-- Port: `8080` on the host → `8080` in the container.
-- Depends on `llamacpp-egpu`.
-- Pushes OpenTelemetry traces/metrics to `otel-collector:4318`.
-- Stores state in a bind-mounted backend data directory.
-
-Started only in `llama` mode.
-
-### Configure iGPU and eGPU endpoints in OpenWebUI
-
-Both llama-server instances (iGPU, eGPU) must be configured as "OpenAI API" endpoints as follows (IP `192.0.2.123` is used as an example here — RFC 5737 documentation range — use the IP address your own VM / machine is running at):
-
-* eGPU
-  * `http://192.0.2.123:8092/v1`
-* iGPU
-  * `http://192.0.2.123:8093/v1`
-
-In the connection config you can add a tag and/or a prefix, which helps dearly with identifying where a model will be served from. E.g. if you assign the prefix `igpu` to the iGPU endpoint, then in e.g. the chat window all models exposed by this endpoint will be available as `igpu.<modelname>`.
-
-## ComfyUI
-
-Two build files exist:
-
-- `Dockerfile.rocm` — active in `comfyui` mode.
-- `Dockerfile` — CPU-only PyTorch variant, not wired into the default compose
-  profile.
-
-### ROCm image
-
-- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
-- PyTorch: nightly ROCm 7.14 wheels (`torch==2.14.0.dev…+rocm7.14`).
-- ComfyUI: pinned release tag `v0.28.0`.
-- Extra Python deps for ComfyUI-GGUF custom nodes: `gguf>=0.13.0`,
-  `sentencepiece`, `protobuf`.
-
-**Note:** I decided to keep the comfyUI docker image, as I started out with testing it on the CPU only and then moved later on to the eGPU. I may remove it later, but for now keep it as a historic reference. It's very slow, though, I recommend to **not** test it out.
-
-### Runtime flags
-
-The compose service overrides the image CMD with performance-oriented flags:
-
-```bash
-python3 main.py --listen 0.0.0.0 --port 8188 \
-  --use-pytorch-cross-attention \
-  --reserve-vram 2 \
-  --cache-ram \
-  --dont-upcast-attention \
-  --async-offload 2 \
-  --preview-method latent2rgb
-```
-
-Environment:
-- `HSA_ENABLE_SDMA=0` — required in this VFIO/KVM passthrough setup to avoid
-  IOMMU TLB-flush storms.
-- `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8` — proactive VRAM
-  reclaim.
-- `LD_PRELOAD=libjemalloc.so.2` — reduces malloc fragmentation.
-
-### Volumes
-
-Models, outputs, inputs, and custom nodes are bind-mounted from the host so
-they persist across rebuilds and can be shared with the CPU image. A patched
-built-in node module is mounted read-only into the image without shadowing
-the rest of the package.
-
-## GROMACS
-
-`gromacs-rocm` is a single-GPU HIP build of GROMACS 2026.3 for RDNA3
-(gfx1100).
-
-### Build (`gromacs/Dockerfile.rocm`)
-
-- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
-- `ENV ROCM_PATH=/opt/rocm` (base image already exports it; kept explicit as a
-  defensive guard).
-- GPU back end: `-DGMX_GPU=HIP -DGMX_HIP_TARGET_ARCH=gfx1100`.
-- SIMD: `-DGMX_SIMD=AVX2_256` (auto-detected AVX-512 segfaults on Zen4 in
-  this build).
-- FFT: GROMACS auto-selects VkFFT for consumer RDNA.
-- MPI: off (`-DGMX_MPI=OFF`); uses built-in thread-MPI.
-- `LD_PRELOAD=libjemalloc.so.2` and `HSA_ENABLE_SDMA=0`.
-
-### Usage
-
-```bash
-make gromacs
-docker compose exec gromacs-rocm bash
-```
-
-Inside the container:
-
-```bash
-gmx mdrun -ntmpi 1 -nb gpu -pme gpu -bonded gpu -update gpu \
-  -deffnm run1
-```
-
-GPU-resident update requires:
-- single rank (`-ntmpi 1`),
-- dynamical integrator (`md` or `sd`),
-- `constraints = h-bonds` in the `.mdp` (not `all-bonds`).
-
-### Smoketest
-
-Builds a 3 nm water box from built-in force-field files (no network
-required), runs energy minimization + a short NVT MD, and verifies the GPU
-was used.
-
-```bash
-make gromacs
-docker compose exec gromacs-rocm bash /work/smoketest.sh
-```
-
-The script:
-1. writes `topol.top`, `em.mdp`, `nvt.mdp` under `/work/_smoketest`;
-2. solvates with `gmx solvate -cs spc216.gro`;
-3. runs EM with `-nb gpu`;
-4. runs NVT with `-nb gpu -pme gpu -update gpu`;
-5. checks `nvt.log` for “Finished mdrun” and GPU-device evidence.
-
-### Stresstest
-
-Downloads one of the MPI-NAT GROMACS benchmark systems and runs it for a
-fixed wall-clock budget, reporting `ns/day`.
-
-```bash
-docker compose exec gromacs-rocm bash /work/stresstest.sh
-```
-
-Available systems:
-
-| System       | Atoms | Constraints | Update step |
-|--------------|-------|-------------|-------------|
-| `benchMEM`   | ~82 k | all-bonds   | CPU         |
-| `benchRIB`   | ~2 M  | all-bonds   | CPU         |
-| `benchPEP`   | ~12 M | all-bonds   | CPU         |
-| `benchPEP-h` | ~12 M | h-bonds     | GPU-capable |
-
-Default run length is 15 minutes; override with a second argument:
-
-```bash
-bash /work/stresstest.sh benchPEP-h 30
-```
-
-Only `benchPEP-h` enables `-update gpu`; the other three force the
-integrator update onto the CPU because of `all-bonds` constraints.
-
-On my setuP (mind that I lowered the powerlimit for the Radeon RX 7900 XTX to 265W) I get the following numbers for stresstesting on the `benchPEP-h` system (h-bond constraints also on GPU):
-
-```
-Step 11900: Run time exceeded 0.247 hours, will terminate the run within 100 steps
-
-| Metric       | Core t (s) | Wall t (s) | (%)   |
-|--------------|------------|------------|-------|
-| **Time**     | 6339.299   | 905.650    | 700.0 |
-
-| Metric          | ns/day | hour/ns | ms/step | Matom*steps/s |
-|-----------------|--------|---------|---------|---------------|
-| **Performance** | 2.290  | 10.481  | 75.465  | 165.581       |
-```
-
-## Blender
-
-`blender-rocm` runs Blender 5.2.0 LTS headless with Cycles/HIP on the eGPU.
-
-### Build (`blender/Dockerfile.rocm`)
-
-- Base: `rocm/dev-ubuntu-24.04:7.14.1-full`.
-- Downloads the official Blender Linux tarball.
-- Installs ROCm runtime libraries and graphics/font/X11 deps required by
-  the official binary.
-- Sets `HSA_ENABLE_SDMA=0` and `LD_PRELOAD=libjemalloc.so.2`.
-
-### `blender-render` wrapper
-
-`blender/bin/blender-render` is copied into `/usr/local/bin`. It forces:
-
-- background mode (`-b`);
-- Cycles engine (`-E CYCLES`);
-- GPU compute device (`bpy.context.scene.cycles.device = 'GPU'`);
-- HIP back end (`-- --cycles-device HIP`).
-
-This lets you submit `.blend` files saved with a CPU device and still render
-on the eGPU.
-
-### File ownership
-
-The service runs as `${UID}:${GID}` (default 1000:1000), so rendered outputs
-are owned by the host user.
-
-### Usage
-
-```bash
-cp scene.blend ${APP_ROOT}/blender/work/
-make blender
-docker compose exec blender-rocm blender-render /work/scene.blend \
-  -f 1 -o /work/output/frame_ -F PNG
-```
-
-One-off project folder override:
-
-```bash
-docker compose run --rm \
-  -v /path/to/project:/work:rw \
-  blender-rocm \
-  blender-render /work/scene.blend -f 1 -o /work/output/frame_ -F PNG
-```
-
-### Smoketest: BMW27
-
-Download `BMW27_2.blend.zip` from
-<https://download.blender.org/demo/test/BMW27_2.blend.zip>, extract it into
-`blender/work/_smoketest/` so the scene is at
-`blender/work/_smoketest/bmw27/bmw27_gpu.blend`, then run:
-
-```bash
-make blender
-docker compose exec blender-rocm bash /work/_smoketest/smoketest.sh
-```
-
-Expected render time: ~11–13 s for frame 1 on the target hardware.
-
-### Stresstest: Barbershop Interior
-
-Download `barbershop_interior.blend` from the Blender demo files and place
-it at `blender/work/_stresstest/barbershop_interior.blend`, then run:
-
-```bash
-docker compose exec blender-rocm bash /work/_stresstest/stresstest.sh
-```
-
-Expected render time: ~1:40–1:50 min for frame 1 on the target hardware.
-
-## Verifying your setup
+### Verifying your setup
 
 | Mode      | Test                       | Command                                                                 | Expected result                        |
 |-----------|----------------------------|-------------------------------------------------------------------------|----------------------------------------|
@@ -575,82 +273,9 @@ Expected render time: ~1:40–1:50 min for frame 1 on the target hardware.
 | `blender` | Stresstest (Barbershop)    | `docker compose exec blender-rocm bash /work/_stresstest/stresstest.sh` | frame 1 in ~1:40–1:50 min              |
 
 The GROMACS smoketest needs no network; the GROMACS stresstest and both
-Blender tests require downloading the assets described in their sections.
-
-## Observability
-
-### `gpu-exporter` (`otel/amdgpu_exporter.py`)
-
-Pure-stdlib Python Prometheus exporter. Reads `/sys/class/drm/card*/device`
-and `/sys/class/hwmon/hwmon*`. Exposes GPU busy %, VRAM/GTT bytes,
-temperatures, power, clocks, fan RPM, and voltages with `gpu=egpu|igpu`
-labels. Port: `9898`.
-
-### `llama-sd` (`otel/llama_sd.py`)
-
-Prometheus HTTP service discovery for `llama-server`. Queries
-`/v1/models` on each server and returns only `loaded` models as scrape
-targets, preventing idle model loads caused by `/metrics?model=X` requests.
-Port: `8099`.
-
-### `otel-collector`
-
-Runs `otel/opentelemetry-collector-contrib:latest` with a bind-mounted
-collector configuration file. Receivers cover Prometheus scrape, Docker
-container stats, host CPU/memory/load, Docker JSON logs, and OTLP gRPC/HTTP
-push from instrumented services.
-
-### Host monitor (`scripts/gpu_monitor.sh`)
-
-Dependency-light bash monitor that reads sysfs directly. Shows both eGPU
-and iGPU in a single colorized, low-flicker view.
-
-```bash
-scripts/gpu_monitor.sh        # refresh every 2 seconds
-scripts/gpu_monitor.sh 1      # refresh every 1 second
-```
-
-Requires `bash`, `awk`, `bc`, `cat`, `printf`, `sleep`, `trap`.
-
-### Grafana
-
-`grafana/dashboards/llama-gpu-amdgpu.json` is a dashboard for llama.cpp
-inference metrics + AMD GPU hardware + host/container resources. The
-provisioning provider in `grafana/provisioning/dashboards/provider.yaml`
-shows how to load it into a Grafana instance outside this compose stack.
-
-My own Grafana backend is running inside its own small Proxmox LXC (with docker installed for still-portable setup). You can find an example setup via `docker compose` and config / .env in the `grafana` folder.
-
-## GPU control: LACT
-
-`lact` runs the official `ghcr.io/ilya-zlobintsev/lact:v0.9.0` image in a
-privileged container so it can write sysfs for power/voltage/fan control.
-
-- Device nodes for the eGPU are passed through.
-- Configuration is bind-mounted from the host and persists across restarts.
-- The tracked example file in `lact/` shows settings for `power_cap`,
-  `voltage_offset`, `performance_level`, and PMFW fan targets.
-
-`scripts/power_bench.py` uses `docker exec lact lact cli` to sweep the GPU
-power limit and record llama.cpp tokens/s to CSV.
-
-The `config.yaml.example` resembles my stable setup. I tested an undervolt of -160mV but am not quite sure that it really is 100% stable, so I settled on -150mV incl power-capping the eGPU at 265W for a better power efficiency sweet-spot (going higher we'll approach diminishing returns quickly). Note: during the Vulkan→ROCm investigation (see Inference section) the -150mV undervolt was explicitly tested as a possible cause of GPU hangs and ruled out — it is stable for this workload.
-
-## Utility scripts
-
-| Script                        | Purpose                                                  |
-|-------------------------------|----------------------------------------------------------|
-| `scripts/switch-mode.sh`      | Stops non-target GPU modes, starts target mode (invoked by the `make` mode targets). |
-| `scripts/gpu_monitor.sh`      | Host sysfs monitor for eGPU + iGPU.                      |
-| `scripts/benchmark.sh`        | Builds llama.cpp variants from `bench_configs.ini` and benchmarks tokens/s. |
-| `scripts/power_bench.py`      | Sweeps GPU power limit via LACT and records tokens/s.    |
-| `hf_download.sh`              | Resumable `wget` download helper for GGUF files.         |
-
-I only use `gpu_monitor.sh` and `hf_download.sh` directly - the gpu-monitor script via a bash alias:
-
-`alias gpumon='/home/<my_user>/docker/genai_stack/scripts/gpu_monitor.sh'`
-
-`switch-mode.sh` is only used via `make` targets, not directly, and both `benchmark.sh` and `power_bench.py` are one-shot benchmark helpers I had created by CoPilot to aide with checking on power-vs-performance sweet spots. I have rarely used them after, but I left them in for reference and in case I might want to pick up further power-finetuning for any reason.
+Blender tests require downloading the assets described in
+[gromacs/README.md](gromacs/README.md) and
+[blender/README.md](blender/README.md).
 
 ## Configuration
 
@@ -672,40 +297,28 @@ ls -l /sys/class/drm/
 
 ## Troubleshooting
 
-- **Qwen3.x models corrupt output on the Vulkan backend** (mistyped tool-call
-  arguments, ignored instructions, invented tasks) or crash the GPU
-  (`decode() failed: vk::Queue::submit: ErrorDeviceLost`). This is a known
-  RADV/llama.cpp issue class — see the linked upstream issues in the
-  Inference section. That is why `llamacpp-egpu` runs ROCm; do not move the
-  eGPU service back to `Dockerfile.vulkan` without re-testing Qwen-family
-  models specifically.
-- **Qwen3.8 residual quirk (accepted):** with `spec-type = draft-mtp`, the
-  first tokens of a response occasionally contain typos (e.g. folder names)
-  which the model reliably self-corrects within its thinking chain. Errors
-  cluster at response start (cold MTP draft context); `cache-reuse = 0` was
-  tested and ruled out. If it ever worsens, test `spec-type = none`.
+Stack-level pitfalls. Component-specific entries live in the respective
+sub-READMEs (e.g. [llamacpp/README.md](llamacpp/README.md) and
+[gromacs/README.md](gromacs/README.md) → Troubleshooting).
+
 - **IOMMU TLB-flush storms (VFIO/KVM passthrough).** All ROCm services set
   `HSA_ENABLE_SDMA=0`; without it, SDMA usage triggers severe TLB-flush
   stalls.
-- **GROMACS crashes with AVX-512.** The Zen 4 build pins
-  `-DGMX_SIMD=AVX2_256` because auto-detected AVX-512 segfaults in this
-  build; do not override without rebuilding and re-verifying.
-- **`gmx mdrun -update gpu` is rejected.** GPU-resident update requires a
-  single rank (`-ntmpi 1`), an `md`/`sd` integrator, and
-  `constraints = h-bonds` (not `all-bonds`) in the `.mdp`.
 - **Container cannot see the GPU.** Check the DRI nodes (`ls -l
   /sys/class/drm/`) and that `RENDER_GID`/`VIDEO_GID` in `.env` match the
   group owners of the render nodes.
 - **VRAM OOM or context-switch stalls.** Two heavy GPU workloads are
   competing for the eGPU — switch to a single mode with `make <mode>`
   instead of starting services manually.
-- **Qwen-family models corrupt file paths in tool calls / reasoning.** If
-  paths that previously appeared in context get mangled
-  (`homelab` → `hommelab`, `ARCHITECTURE.md` → `ARCHITECTURD.md`, etc.),
-  check the model's `models.ini` section for `dry-*` parameters. DRY
-  (Don't Repeat Yourself) penalizes repeated token sequences, which is
-  useful for prose but actively harmful for exact strings like file paths,
-  JSON keys, and shell commands. Remove or comment out `dry-multiplier`,
-  `dry-base`, and `dry-allowed-length` for Qwen-family (and other
-  agentic/tool-calling) models. If removing DRY causes repetition loops,
-  raise `repeat-penalty` slightly (e.g. from `1.0` to `1.01`) instead.
+
+## Disclaimer
+
+> **This stack, and therefore also this README, have been conceived, implemented and written with significant usage of LLMs (e.g. Github CoPilot).**
+
+> In parts, you can expect the percentage to be 90% implementation by AI, with 90% steering and specification done by a human (me). In other parts, this may change to 100% implementation by AI and only 50% steering by me, because during spec and finetuning with AI I let it loose when I suspected it's intended direction fit my own needs and hardware (e.g. OTel instrumentation via the `llama-sd` component, or `lact`). I let AI write the scaffolding of the README and other docs based on hard factual knowledge extracted from the codebase, let it integrate todos and pointers for me to fill in with my own intentions, information, goals etc, and the result is the README you are currently reading. It's a mixture of purely human-written parts, mixed together with parts written 80-100% by AI.
+
+> Also, this stack and repo are in a state of slow, yet steady, flow - it cannot be considered stable, easy to setup and following a strict release cycle yet (and probably for all eternity). This repo is deliberately experimental and supports my own hardware and use cases as optimal as possible. It is not something that applies on a generalistic scale.
+
+## Maintainer note
+
+Public snapshot via the publish pipeline (`docs/publishing.md`, private to this repo).

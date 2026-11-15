@@ -3,7 +3,7 @@
 # transient python:3.12-slim container on the host network, so it works in
 # every stack mode against localhost. One-time: docker pull python:3.12-slim
 #
-# Usage: tmd <list|get|new-lane|new-card|edit|append|move|claim|to-top|reorder|rm|img> ...
+# Usage: tmd <list|get|new-lane|new-card|edit|append|move|claim|to-top|reorder|rm|img|sync-template> ...
 #        (content commands read from stdin:  tmd edit Lane/card.md < file)
 # TASKS_MD_URL overrides the board URL (default http://localhost:8090); it is
 # passed into the container only when set.
@@ -15,7 +15,11 @@ TZ="$(readlink -f /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p')"
 [ -n "$TZ" ] || TZ="UTC"
 ENV_ARGS="-e TZ=${TZ}"
 [ -n "${TASKS_MD_URL:-}" ] && ENV_ARGS="$ENV_ARGS -e TASKS_MD_URL=${TASKS_MD_URL}"
+# Canonical card template (new-card --template / sync-template): mount it
+# read-only when present so container mode can see it.
+MOUNTS="-v ${DIR}/tmd.py:/tools/tmd.py:ro"
+[ -f "${DIR}/../card-template.md" ] && \
+  MOUNTS="$MOUNTS -v ${DIR}/../card-template.md:/tools/card-template.md:ro"
 # shellcheck disable=SC2086
-exec docker run --rm -i --network host $ENV_ARGS \
-  -v "${DIR}/tmd.py":/tools/tmd.py:ro \
+exec docker run --rm -i --network host $ENV_ARGS $MOUNTS \
   python:3.12-slim python3 /tools/tmd.py "$@"

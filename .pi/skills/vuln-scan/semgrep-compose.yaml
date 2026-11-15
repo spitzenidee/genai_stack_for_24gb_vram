@@ -1,0 +1,149 @@
+# vuln-scan — in-skill Semgrep ruleset: docker-compose misconfiguration.
+#
+# Why: the Semgrep Registry has no p/yaml ruleset (404, verified
+# 08.11.2026) and Trivy's misconfig scanner does not support docker compose
+# (official coverage matrix: Compose "-"; aquasecurity/trivy#8729 open, no
+# timeline). This small ruleset closes the compose gap.
+#
+# Wiring: scripts/vuln-scan.sh adds it to the semgrep tier as an explicit
+# --config file, mounted :ro from the skill dir (never from the scanned
+# repo — same pattern as the sloppy-joe config mount). Privacy invariants
+# apply: --metrics off, never --config auto.
+#
+# Scope: rules apply only to docker-compose file names (paths.include), so
+# other YAML (otel / grafana config) is not flagged.
+#
+# Severity mapping (stdout summary): Semgrep INFO->LOW, WARNING->MEDIUM,
+# ERROR->HIGH (same as the registry rulesets).
+rules:
+  - id: compose-privileged-true
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Container runs in privileged mode (full host device access and
+      capabilities) — avoid `privileged: true`.
+    patterns:
+      - pattern: "privileged: true"
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  - id: compose-root-user
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Container runs as root — set an unprivileged `user:`.
+    pattern-either:
+      - pattern: 'user: "root"'
+      - pattern: "user: root"
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  - id: compose-host-network
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Container uses the host network namespace (network isolation lost) —
+      prefer a dedicated network.
+    patterns:
+      - pattern: "network_mode: host"
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  - id: compose-cap-add-all
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Container is granted ALL Linux capabilities (CAP_ALL) — grant only
+      the specific capabilities it needs.
+    pattern-either:
+      - pattern: |
+          cap_add:
+            - "CAP_ALL"
+      - pattern: |
+          cap_add:
+            - CAP_ALL
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  - id: compose-privileged-port
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      Host port below 1024 is mapped — binding it requires root on the host
+      (or CAP_NET_BIND_SERVICE).
+    patterns:
+      - pattern: |
+          ports:
+            - "$P"
+      - metavariable-regex:
+          metavariable: $P
+          regex: ^"?[0-9]{1,3}:[0-9]+
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  # The two "missing property" rules are anchored on the service definition
+  # itself (subtree match on a mapping with an `image:` key) because the OSS
+  # generic YAML engine only supports partial-mapping (`...`) matches at
+  # depth <= 2 from the pattern root — a `services:`-anchored pattern-not is
+  # too deep and never matches (verified 08.11.2026 on the pinned image).
+  # Consequence: a service defined via `build:` only (no `image:` key) is
+  # not checked by these two rules.
+
+  - id: compose-missing-readonly
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      Service has no `read_only: true` root filesystem — set
+      `read_only: true` and mount only the paths the container writes to.
+    patterns:
+      - pattern: |
+          $S:
+            image: $IMG
+            ...
+      - pattern-not: |
+          $S:
+            read_only: true
+            ...
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"
+
+  - id: compose-missing-resource-limits
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      Service has no resource limits (`deploy.resources.limits`) — set
+      CPU/memory limits so one container cannot starve the host.
+    patterns:
+      - pattern: |
+          $S:
+            image: $IMG
+            ...
+      - pattern-not: |
+          $S:
+            deploy:
+              resources:
+                limits: ...
+            ...
+    paths:
+      include:
+        - docker-compose*.y*ml
+        - compose.y*ml
+        - "*.compose.y*ml"

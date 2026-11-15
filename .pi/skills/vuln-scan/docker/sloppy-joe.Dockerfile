@@ -1,13 +1,13 @@
 # vuln-scan-sloppy-joe — sloppy-joe (multi-ecosystem slopsquatting /
 # typosquatting / provenance scanner)
 #
-# Upstream: https://github.com/brennhill/sloppy-joe (Apache-2.0, v1.1.0,
-# commit 3d9d413605e384c98c243147441cdf25a6e2ba77).
+# Upstream: https://github.com/brennhill/sloppy-joe (Apache-2.0, v2.1.0,
+# commit 62dfeadafa6fd209547fbe362214e0a57e28adbe).
 # Prebuilt static musl binary from GitHub Releases — no build step, no
 # runtime deps (single static binary -> FROM scratch).
 #
 # The release tarball extracts to sloppy-joe-<target>/sloppy-joe. The
-# sha256 pins below are the release-asset digests for v1.1.0 (verified
+# sha256 pins below are the release-asset digests for v2.1.0 (verified
 # against the GitHub API + the published .sha256 files). To bump the
 # version: update VERSION + both SHA256 args, rebuild, note in the board
 # card Log.
@@ -24,11 +24,11 @@
 # similarity queries + OSV.dev — package names only, never code.
 
 FROM alpine:3.20 AS fetch
-ARG VERSION=1.1.0
+ARG VERSION=2.1.0
 ARG TARGETARCH
-# Release-asset sha256 pins for v1.1.0 (sloppy-joe-<arch>-unknown-linux-musl.tar.xz).
-ARG X86_64_SHA256=f1bae62dd183ff4da42f7f59250e7876ad96d7629e29642b43c3b8fecee82a41
-ARG AARCH64_SHA256=f2f60454f2fb89a180b1dbcdec2521ee8d12f8d9087feafed109bed9ab486879
+# Release-asset sha256 pins for v2.1.0 (sloppy-joe-<arch>-unknown-linux-musl.tar.xz).
+ARG X86_64_SHA256=8e20dca0cdc338339a5f1a4dc4eeec29609dbf3b3ae0f858b299f45000768ad1
+ARG AARCH64_SHA256=9db27f21d9c8191f87a568b2585048219d81cad43de4c13e3f5e0b1bab71636a
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-musl;  sha=$X86_64_SHA256 ;; \

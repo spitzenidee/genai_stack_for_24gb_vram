@@ -32,8 +32,8 @@ FAKE_RESOURCE = [
     {"name": "Ready", "files": []},
     {"name": "OnHold", "files": []},
     {"name": "Review", "files": [
-        {"name": "clean-card", "content": "[tag:ai-reviewed] [tag:genai_stack]\n\n# clean\n"},
-        {"name": "tagged-first", "content": "[tag:review-by-ai] [tag:genai_stack]\n\n# first\n"},
+        {"name": "clean-card", "content": "[tag:ai-reviewed]\n\n# clean\n"},
+        {"name": "tagged-first", "content": "[tag:review-by-ai]\n\n# first\n"},
         {"name": "tagged-second", "content": "[tag:review-by-ai]\n\n# second\n"},
     ]},
 ]
@@ -48,7 +48,8 @@ def test_tag_helpers():
           o.review_tags(FAKE_RESOURCE) == {"tagged-first", "tagged-second"},
           f"got {o.review_tags(FAKE_RESOURCE)!r}")
     check("_card_tags parses multi-tag line",
-          o._card_tags("[tag:review-by-ai] [tag:genai_stack]\nrest") == ["review-by-ai", "genai_stack"])
+          o._card_tags("[tag:review-by-ai] [tag:ai-reviewed]\nrest") == ["review-by-ai", "ai-reviewed"])
+    check("_card_tags empty line 1 -> []", o._card_tags("\nrest") == [])
     check("active_on_disk from resource", o.active_on_disk(FAKE_RESOURCE) == set())
     # No tagged cards -> None.
     empty = [dict(l, files=[dict(f, content="[tag:x]\n") for f in l["files"]]) for l in FAKE_RESOURCE]
@@ -62,14 +63,16 @@ def _mk_state(slot=None):
 
 
 def test_evaluate_launch_review_trigger():
-    print("evaluate_launch — Review is the 4th trigger")
+    print("evaluate_launch — Review is the 2nd trigger")
     # Monkeypatch the eGPU probe + launch + pre-launch pull so nothing real
     # happens (board_move_card would hit the live board otherwise).
     o.egpu_up = lambda: True
-    o.board_move_card = lambda card, src, dst: None
+    o.egpu_busy_avg = lambda: 0  # idle eGPU — no real sysfs reads/sleeps
+    pulls = []
+    o.board_move_card = lambda card, src, dst: pulls.append((card, src, dst))
     launched = {}
 
-    def fake_launch(state, now, trigger):
+    def fake_launch(state, now, trigger, card_model=None, worker_cwd=None):
         launched["trigger"] = trigger
         state["slot"] = {"pid": 999999, "card": trigger[1], "mode": "review" if trigger[0] == "Review" else "implement",
                          "start_time": None, "card_seen_active": False, "started_at": now,
@@ -84,14 +87,17 @@ def test_evaluate_launch_review_trigger():
           launched.get("trigger") == ("Review", "tagged-first"), f"got {launched.get('trigger')!r}")
     check("slot mode = review", st["slot"]["mode"] == "review")
 
-    # Ready present -> Ready preempts Review (and is pulled into Active:
-    # the launch trigger is re-assigned to ("Active", card) after the pull).
+    # Ready present -> Review preempts Ready; NO pre-launch pull (the pull
+    # applies only to Ready triggers).
     launched.clear()
+    pulls.clear()
     st = _mk_state()
     o.evaluate_launch(st, now, active=[], onhold=[], ready=["ready-card"], review_trigger="tagged-first")
-    check("Ready preempts Review (pulled to Active)",
-          launched.get("trigger") == ("Active", "ready-card"),
+    check("Review preempts Ready (no pull)",
+          launched.get("trigger") == ("Review", "tagged-first"),
           f"got {launched.get('trigger')!r}")
+    check("no pre-launch pull for a Review trigger (Ready case)",
+          pulls == [], f"pulls={pulls!r}")
 
     # Active present -> Active preempts all.
     launched.clear()
@@ -100,11 +106,26 @@ def test_evaluate_launch_review_trigger():
     check("Active preempts Ready+Review", launched.get("trigger") == ("Active", "active-card"),
           f"got {launched.get('trigger')!r}")
 
-    # OnHold present, no Active/Ready -> OnHold preempts Review.
+    # OnHold present, no Active/Ready -> Review preempts OnHold.
+    launched.clear()
+    pulls.clear()
+    st = _mk_state()
+    o.evaluate_launch(st, now, active=[], onhold=["onhold-card"], ready=[],
+                      review_trigger="tagged-first",
+                      onhold_trigger=("OnHold", "onhold-card"))
+    check("Review preempts OnHold", launched.get("trigger") == ("Review", "tagged-first"),
+          f"got {launched.get('trigger')!r}")
+    check("no pre-launch pull for a Review trigger (OnHold case)",
+          pulls == [], f"pulls={pulls!r}")
+
+    # OnHold alone (no Active/Review/Ready) -> OnHold is still launched
+    # (4th trigger).
     launched.clear()
     st = _mk_state()
-    o.evaluate_launch(st, now, active=[], onhold=["onhold-card"], ready=[], review_trigger="tagged-first")
-    check("OnHold preempts Review", launched.get("trigger") == ("OnHold", "onhold-card"),
+    o.evaluate_launch(st, now, active=[], onhold=["onhold-card"], ready=[],
+                      review_trigger=None, onhold_trigger=("OnHold", "onhold-card"))
+    check("OnHold alone still launches (4th trigger)",
+          launched.get("trigger") == ("OnHold", "onhold-card"),
           f"got {launched.get('trigger')!r}")
 
     # Nothing at all -> no launch, idle_no_work set.
@@ -196,8 +217,10 @@ def test_mode_aware_exit_timer():
 
 def test_worker_model_passthrough():
     print("WORKER_MODEL per-mode config + --model passthrough")
-    check("WORKER_MODEL has both modes", set(o.WORKER_MODEL) == {"implement", "review"})
-    check("V1 both None (pi default)", o.WORKER_MODEL["implement"] is None and o.WORKER_MODEL["review"] is None)
+    check("WORKER_MODEL has all three modes",
+          set(o.WORKER_MODEL) == {"implement", "review", "refine"})
+    check("V1 all None (pi default)",
+          all(v is None for v in o.WORKER_MODEL.values()))
     # Simulate the cmd build in launch_worker (card-specific prompts).
     for mode, model in (("implement", None), ("review", "igpu-Gemma4-26B-A4B")):
         if mode == "review":
